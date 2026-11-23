@@ -529,22 +529,41 @@ export function EditTransactionModal({
 
               {repeatType === "INSTALLMENTS" && (
                 <div className="pt-2 border-t border-slate-800/60 space-y-1.5 text-xs">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Dividir o valor total em parcelas de:</span>
-                    <select
-                      value={installments}
-                      onChange={(e) => setInstallments(Number(e.target.value))}
-                      className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-100 focus:outline-none"
-                    >
-                      <option value={2}>2x</option>
-                      <option value={3}>3x</option>
-                      <option value={4}>4x</option>
-                      <option value={5}>5x</option>
-                      <option value={6}>6x</option>
-                      <option value={10}>10x</option>
-                      <option value={12}>12x</option>
-                      <option value={24}>24x</option>
-                    </select>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-slate-400">Dividir o valor total em:</span>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={installments}
+                        onChange={(e) => setInstallments(Number(e.target.value))}
+                        className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-100 focus:outline-none"
+                      >
+                        <option value={2}>2x</option>
+                        <option value={3}>3x</option>
+                        <option value={4}>4x</option>
+                        <option value={5}>5x</option>
+                        <option value={6}>6x</option>
+                        <option value={7}>7x</option>
+                        <option value={8}>8x</option>
+                        <option value={9}>9x</option>
+                        <option value={10}>10x</option>
+                        <option value={11}>11x</option>
+                        <option value={12}>12x</option>
+                        <option value={18}>18x</option>
+                        <option value={24}>24x</option>
+                        <option value={36}>36x</option>
+                      </select>
+                      {(() => {
+                        const num = parseFloat(amount.replace(/\./g, "").replace(",", "."));
+                        if (!isNaN(num) && num > 0) {
+                          return (
+                            <span className="text-[11px] font-semibold text-indigo-300 bg-indigo-500/15 px-2 py-0.5 rounded border border-indigo-500/30">
+                              {installments}x de R$ {(num / installments).toFixed(2).replace(".", ",")}
+                            </span>
+                          );
+                        }
+                        return null;
+                      })()}
+                    </div>
                   </div>
                   {transaction.installmentPlanId && (
                     <p className="text-[11px] text-indigo-300/80">
