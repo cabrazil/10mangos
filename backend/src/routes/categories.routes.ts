@@ -1,7 +1,8 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { CategoryType } from '@prisma/client';
+import { CategoryType, RuleMatchField, RuleMatchType } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
+import { runAutoCategorization } from '../lib/auto-categorizer.js';
 
 export async function categoryRoutes(app: FastifyInstance) {
   app.addHook('preHandler', app.authenticate);
@@ -96,5 +97,104 @@ export async function categoryRoutes(app: FastifyInstance) {
 
     const updated = await prisma.category.findUnique({ where: { id } });
     return updated;
+  });
+
+  // Executar auto-categorização inteligente em lote
+  app.post('/auto-categorize', async (request, reply) => {
+    const { workspaceId } = request.user;
+
+    const schema = z.object({
+      transactionIds: z.array(z.string().uuid()).optional(),
+      overwriteExisting: z.boolean().optional().default(false),
+      dryRun: z.boolean().optional().default(false),
+    });
+
+    const options = schema.parse(request.body || {});
+
+    const result = await runAutoCategorization(prisma, workspaceId, options);
+    return reply.send(result);
+  });
+
+  // Listar regras de categorização
+  app.get('/rules', async (request) => {
+    const { workspaceId } = request.user;
+
+    const rules = await prisma.categorizationRule.findMany({
+      where: { workspaceId },
+      include: {
+        category: {
+          select: {
+            id: true,
+            name: true,
+            parent: { select: { id: true, name: true } },
+          },
+        },
+      },
+      orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }],
+    });
+
+    return rules;
+  });
+
+  // Criar regra de categorização
+  app.post('/rules', async (request, reply) => {
+    const { workspaceId } = request.user;
+
+    const createRuleSchema = z.object({
+      name: z.string().min(1, 'Nome da regra é obrigatório'),
+      pattern: z.string().min(1, 'Padrão de busca é obrigatório'),
+      matchField: z.nativeEnum(RuleMatchField).default(RuleMatchField.DESCRIPTION),
+      matchType: z.nativeEnum(RuleMatchType).default(RuleMatchType.CONTAINS),
+      caseSensitive: z.boolean().default(false),
+      priority: z.number().int().default(100),
+      categoryId: z.string().uuid('Categoria inválida'),
+      setDescription: z.string().optional(),
+    });
+
+    const data = createRuleSchema.parse(request.body);
+
+    // Valida categoria no workspace
+    const cat = await prisma.category.findFirst({
+      where: { id: data.categoryId, workspaceId },
+    });
+
+    if (!cat) {
+      return reply.status(400).send({ error: 'Categoria não encontrada no workspace' });
+    }
+
+    const rule = await prisma.categorizationRule.create({
+      data: {
+        workspaceId,
+        name: data.name,
+        pattern: data.pattern,
+        matchField: data.matchField,
+        matchType: data.matchType,
+        caseSensitive: data.caseSensitive,
+        priority: data.priority,
+        categoryId: data.categoryId,
+        setDescription: data.setDescription,
+      },
+      include: {
+        category: true,
+      },
+    });
+
+    return reply.status(201).send(rule);
+  });
+
+  // Excluir regra
+  app.delete('/rules/:id', async (request, reply) => {
+    const { workspaceId } = request.user;
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+
+    const deleted = await prisma.categorizationRule.deleteMany({
+      where: { id, workspaceId },
+    });
+
+    if (deleted.count === 0) {
+      return reply.status(404).send({ error: 'Regra não encontrada' });
+    }
+
+    return reply.status(204).send();
   });
 }

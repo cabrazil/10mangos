@@ -70,7 +70,15 @@ export async function transactionRoutes(app: FastifyInstance) {
         where,
         include: {
           account: { select: { id: true, name: true, type: true, color: true } },
-          category: { select: { id: true, name: true, type: true, color: true } },
+          category: {
+            select: {
+              id: true,
+              name: true,
+              type: true,
+              color: true,
+              parent: { select: { id: true, name: true } },
+            },
+          },
           payee: { select: { id: true, name: true } },
           splits: { include: { category: true } },
           tags: true,

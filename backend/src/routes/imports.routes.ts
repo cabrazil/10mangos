@@ -6,6 +6,7 @@ import { ImportSource, ImportStatus, ImportRowStatus, TransactionSource, Transac
 import { parseOfxString } from '../lib/ofx-parser.js';
 import { parseItauCardStatement } from '../lib/itau-card-parser.js';
 import { parseNubankCsv } from '../lib/nubank-parser.js';
+import { runAutoCategorization } from '../lib/auto-categorizer.js';
 import { prisma } from '../lib/prisma.js';
 
 export async function importRoutes(app: FastifyInstance) {
@@ -476,6 +477,10 @@ export async function importRoutes(app: FastifyInstance) {
         inserted++;
       }
 
+      if (inserted > 0) {
+        await runAutoCategorization(prisma, workspaceId).catch(() => {});
+      }
+
       return reply.send({
         message: 'Extrato OFX importado com sucesso',
         inserted,
@@ -590,6 +595,10 @@ export async function importRoutes(app: FastifyInstance) {
           });
 
           inserted++;
+        }
+
+        if (inserted > 0) {
+          await runAutoCategorization(prisma, workspaceId).catch(() => {});
         }
 
         return reply.send({
@@ -748,6 +757,10 @@ export async function importRoutes(app: FastifyInstance) {
           inserted++;
         }
 
+        if (inserted > 0) {
+          await runAutoCategorization(prisma, workspaceId).catch(() => {});
+        }
+
         return reply.send({
           message: 'Fatura de Cartão Itaú importada com sucesso',
           inserted,
@@ -881,6 +894,10 @@ export async function importRoutes(app: FastifyInstance) {
       });
 
       inserted++;
+    }
+
+    if (inserted > 0) {
+      await runAutoCategorization(prisma, workspaceId).catch(() => {});
     }
 
     return reply.send({

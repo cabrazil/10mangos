@@ -34,6 +34,7 @@ export function EditTransactionModal({
   const [repeatType, setRepeatType] = useState<"SINGLE" | "RECURRING" | "INSTALLMENTS">("SINGLE");
   const [recurringMonths, setRecurringMonths] = useState(12);
   const [installments, setInstallments] = useState(1);
+  const [createRule, setCreateRule] = useState(false);
   const [loading, setLoading] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [copying, setCopying] = useState(false);
@@ -137,6 +138,30 @@ export function EditTransactionModal({
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.message || data.error || "Erro ao atualizar lançamento");
+      }
+
+      // Se marcou para lembrar da regra, cria no servidor
+      if (createRule && categoryId && type !== "TRANSFER") {
+        const cleanPattern = description
+          .replace(/\s*-\s*Parcela\s*\d+\/\d+/i, "")
+          .replace(/\s*\(\d+\/\d+\)/g, "")
+          .trim();
+
+        if (cleanPattern.length >= 3) {
+          fetch("http://localhost:3333/api/categories/rules", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({
+              name: `Regra: ${cleanPattern}`,
+              pattern: cleanPattern,
+              matchType: "CONTAINS",
+              categoryId,
+            }),
+          }).catch((e) => console.error("Erro ao criar regra:", e));
+        }
       }
 
       onSuccess?.();
@@ -350,6 +375,23 @@ export function EditTransactionModal({
                 onSelect={(id) => setCategoryId(id)}
                 placeholder="Digite para buscar categoria/subcategoria (ex: cond, pam)..."
               />
+              {categoryId && (
+                <div className="flex items-center gap-2 p-2.5 rounded-xl bg-slate-900/60 border border-slate-800 text-xs text-slate-300 mt-2">
+                  <input
+                    type="checkbox"
+                    id="createRuleCheck"
+                    checked={createRule}
+                    onChange={(e) => setCreateRule(e.target.checked)}
+                    className="rounded bg-slate-950 border-slate-700 text-emerald-500 focus:ring-emerald-500/20"
+                  />
+                  <label htmlFor="createRuleCheck" className="cursor-pointer select-none">
+                    Lembrar desta escolha para lançamentos semelhantes{" "}
+                    <span className="text-emerald-400 font-medium">
+                      ("{description.replace(/\s*-\s*Parcela\s*\d+\/\d+/i, "").replace(/\s*\(\d+\/\d+\)/g, "").trim()}")
+                    </span>
+                  </label>
+                </div>
+              )}
             </div>
           )}
 

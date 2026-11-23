@@ -24,6 +24,7 @@ import {
   Filter,
   X,
   Landmark,
+  Zap,
 } from "lucide-react";
 import { formatCurrency, formatDate, computeShiftedDate } from "@/lib/utils";
 import { NewTransactionModal } from "@/components/NewTransactionModal";
@@ -41,6 +42,7 @@ export default function DashboardPage() {
   const [isNewTxOpen, setIsNewTxOpen] = useState(false);
   const [newTxInitialData, setNewTxInitialData] = useState<any | null>(null);
   const [isImportOpen, setIsImportOpen] = useState(false);
+  const [isAutoCategorizing, setIsAutoCategorizing] = useState(false);
   const [selectedTxForEdit, setSelectedTxForEdit] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -250,6 +252,39 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleAutoCategorize() {
+    const token = localStorage.getItem("token");
+    if (!token) return;
+
+    setIsAutoCategorizing(true);
+    try {
+      const res = await fetch(`${API_BASE}/categories/auto-categorize`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({}),
+      });
+
+      if (!res.ok) {
+        throw new Error("Erro ao executar auto-categorização");
+      }
+
+      const data = await res.json();
+      if (data.updatedCount > 0) {
+        alert(`⚡ Sucesso! ${data.updatedCount} ${data.updatedCount === 1 ? "lançamento foi categorizado" : "lançamentos foram categorizados"} automaticamente.`);
+        await loadData(token, currentDate);
+      } else {
+        alert("Nenhum lançamento pendente de categorização compatível com as regras ou dicionário foi encontrado.");
+      }
+    } catch (err: any) {
+      alert(err.message || "Erro na auto-categorização");
+    } finally {
+      setIsAutoCategorizing(false);
+    }
+  }
+
   // Separar cartões de contas
   const bankAccounts = accounts.filter((a) => a.type !== "CREDIT_CARD");
   const creditCards = accounts.filter((a) => a.type === "CREDIT_CARD");
@@ -312,6 +347,10 @@ export default function DashboardPage() {
   );
   const creditCardTxCount = useMemo(
     () => monthlyTransactions.filter((t) => t.account?.type === "CREDIT_CARD").length,
+    [monthlyTransactions]
+  );
+  const uncategorizedMonthlyCount = useMemo(
+    () => monthlyTransactions.filter((t) => !t.categoryId).length,
     [monthlyTransactions]
   );
 
@@ -503,6 +542,15 @@ export default function DashboardPage() {
           </div>
 
           <div className="flex items-center gap-3">
+            <button
+              onClick={handleAutoCategorize}
+              disabled={isAutoCategorizing}
+              className="flex items-center gap-2 bg-gradient-to-r from-amber-500/10 to-amber-600/15 hover:from-amber-500/20 hover:to-amber-600/25 border border-amber-500/40 text-amber-300 font-semibold px-3.5 py-2 rounded-lg text-sm transition-all shadow-sm hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
+              title="Identificar e categorizar lançamentos automaticamente pela descrição"
+            >
+              <Zap className={`h-4 w-4 text-amber-400 ${isAutoCategorizing ? "animate-pulse" : ""}`} />
+              <span>{isAutoCategorizing ? "Categorizando..." : "Auto-categorizar"}</span>
+            </button>
             <button
               onClick={() => setIsImportOpen(true)}
               className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 font-semibold px-4 py-2 rounded-lg text-sm transition-all"
@@ -736,6 +784,17 @@ export default function DashboardPage() {
                 <div>
                   <div className="flex items-center gap-2">
                     <h3 className="text-base font-bold text-slate-100">Lançamentos de {capitalizedMonth}</h3>
+                    {uncategorizedMonthlyCount > 0 && (
+                      <button
+                        onClick={handleAutoCategorize}
+                        disabled={isAutoCategorizing}
+                        className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-300 hover:bg-amber-500/25 text-[11px] font-semibold transition-colors"
+                        title="Identificar e categorizar lançamentos automaticamente"
+                      >
+                        <Zap className="h-3 w-3 text-amber-400" />
+                        <span>{uncategorizedMonthlyCount} sem categoria</span>
+                      </button>
+                    )}
                     {selectedAccountName && (
                       <span className="inline-flex items-center gap-1 text-xs px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-200 border border-slate-700">
                         {selectedAccountName}
@@ -966,8 +1025,18 @@ export default function DashboardPage() {
                                 return null;
                               })()}
                               <span>•</span>
-                              <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-medium">
-                                {tx.category?.name || "Sem categoria"}
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[11px] font-medium ${
+                                  tx.category
+                                    ? "bg-slate-800 text-slate-300"
+                                    : "bg-amber-500/15 text-amber-300 border border-amber-500/30 font-semibold"
+                                }`}
+                              >
+                                {tx.category
+                                  ? tx.category.parent
+                                    ? `${tx.category.parent.name} > ${tx.category.name}`
+                                    : tx.category.name
+                                  : "Sem categoria"}
                               </span>
                               <span>•</span>
                               {tx.account?.type === "CREDIT_CARD" ? (
