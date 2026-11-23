@@ -610,7 +610,25 @@ export async function importRoutes(app: FastifyInstance) {
         let inserted = 0;
         let skipped = 0;
 
-        for (const trn of itauCardParsed.transactions) {
+        let invoiceCompetence: Date | null = null;
+        if (itauCardParsed.faturaTitle) {
+          const monthsMap: Record<string, number> = {
+            janeiro: 1, fevereiro: 2, março: 3, marco: 3, abril: 4, maio: 5, junho: 6,
+            julho: 7, agosto: 8, setembro: 9, outubro: 10, novembro: 11, dezembro: 12
+          };
+          const match = itauCardParsed.faturaTitle.toLowerCase().match(/(janeiro|fevereiro|março|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\/(\d{4})/i);
+          if (match) {
+            const mName = match[1];
+            const yNum = parseInt(match[2], 10);
+            const mNum = monthsMap[mName] || 11;
+            invoiceCompetence = new Date(Date.UTC(yNum, mNum - 1, 1, 12, 0, 0));
+          }
+        }
+
+        const occurrences = new Map<string, number>();
+
+        for (let i = 0; i < itauCardParsed.transactions.length; i++) {
+          const trn = itauCardParsed.transactions[i];
           // Regra de sinal do cartão de crédito:
           // Compra na fatura é um débito/despesa (sinal negativo no 10mangos)
           // Pagamento de fatura/crédito reduz a dívida (sinal positivo no 10mangos)
@@ -668,14 +686,38 @@ export async function importRoutes(app: FastifyInstance) {
             }
           }
 
+          // Competência de fatura para compras do ciclo anterior
+          let competenceDate: Date | null = null;
+          if (invoiceCompetence && !trn.isPayment) {
+            const trnYear = trn.date.getUTCFullYear();
+            const trnMonth = trn.date.getUTCMonth();
+            const invYear = invoiceCompetence.getUTCFullYear();
+            const invMonth = invoiceCompetence.getUTCMonth();
+            if (trnYear !== invYear || trnMonth !== invMonth) {
+              competenceDate = invoiceCompetence;
+            }
+          }
+
           const dateStr = trn.rawDate || trn.date.toISOString().split('T')[0];
+          const occKey = `${dateStr}_${amount}_${trn.originalDescription}`;
+          const occIndex = (occurrences.get(occKey) || 0) + 1;
+          occurrences.set(occKey, occIndex);
+
           const importHash = crypto
+            .createHash('sha256')
+            .update(`${account.id}_${dateStr}_${amount}_${trn.originalDescription}_${trn.cardNumber || ''}_#${occIndex}`)
+            .digest('hex');
+
+          const legacyHash = crypto
             .createHash('sha256')
             .update(`${account.id}_${dateStr}_${amount}_${trn.originalDescription}_${trn.cardNumber || ''}`)
             .digest('hex');
 
           const existing = await prisma.transaction.findFirst({
-            where: { accountId: account.id, importHash },
+            where: {
+              accountId: account.id,
+              OR: [{ importHash }, { importHash: legacyHash }],
+            },
           });
 
           if (existing) {
@@ -692,6 +734,7 @@ export async function importRoutes(app: FastifyInstance) {
               source: TransactionSource.EXCEL_IMPORT,
               amount,
               date: trn.date,
+              competenceDate,
               description: trn.description,
               originalDescription: trn.originalDescription,
               categoryId,
