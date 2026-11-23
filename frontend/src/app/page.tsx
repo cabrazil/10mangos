@@ -260,8 +260,11 @@ export default function DashboardPage() {
   }
 
   function handlePayInvoice(card: any) {
-    const defaultChecking = bankAccounts[0]?.id || accounts[0]?.id || "";
-    const balance = Math.abs(Number(card.currentBalance || 0));
+    const defaultChecking = card.paymentAccountId || bankAccounts[0]?.id || accounts[0]?.id || "";
+    const monthlyCardExpense = monthlyTransactions
+      .filter((t) => t.accountId === card.id && t.type === "EXPENSE")
+      .reduce((acc, curr) => acc + Math.abs(Number(curr.amount)), 0);
+    const balance = monthlyCardExpense > 0 ? monthlyCardExpense : Math.abs(Number(card.currentBalance || 0));
 
     setNewTxInitialData({
       type: "TRANSFER",
@@ -336,13 +339,21 @@ export default function DashboardPage() {
   const filteredTotals = useMemo(() => {
     let income = 0;
     let expense = 0;
+    let transfers = 0;
     displayedTransactions.forEach((tx) => {
       const val = Math.abs(Number(tx.amount));
       if (tx.type === "INCOME") income += val;
       else if (tx.type === "EXPENSE") expense += val;
+      else if (tx.type === "TRANSFER") transfers += val;
     });
-    return { income, expense, balance: income - expense };
+    return { income, expense, transfers, balance: income - expense };
   }, [displayedTransactions]);
+
+  const isCardFilterActive = useMemo(() => {
+    if (accountFilter === "CREDIT_CARDS") return true;
+    const acc = accounts.find((a) => a.id === accountFilter);
+    return acc?.type === "CREDIT_CARD";
+  }, [accountFilter, accounts]);
 
   // Nome da conta selecionada quando for filtro específico
   const selectedAccountName = useMemo(() => {
@@ -601,7 +612,10 @@ export default function DashboardPage() {
                   ) : (
                     creditCards.map((card) => {
                       const isSelected = accountFilter === card.id;
-                      const balance = Math.abs(Number(card.currentBalance || 0));
+                      const monthlyCardExpense = monthlyTransactions
+                        .filter((t) => t.accountId === card.id && t.type === "EXPENSE")
+                        .reduce((acc, curr) => acc + Math.abs(Number(curr.amount)), 0);
+                      const balance = monthlyCardExpense > 0 ? monthlyCardExpense : Math.abs(Number(card.currentBalance || 0));
                       const limit = Number(card.creditLimit || 20000);
                       const percentage = Math.min(100, Math.round((balance / limit) * 100));
                       return (
@@ -740,7 +754,20 @@ export default function DashboardPage() {
                     {accountFilter !== "ALL" || searchTerm ? ` (de ${monthlyTransactions.length} no mês)` : ""}
                     {displayedTransactions.length > 0 && (
                       <span className="ml-1 text-slate-500">
-                        · Total do filtro: <strong className={filteredTotals.balance >= 0 ? "text-emerald-400" : "text-rose-400"}>{formatCurrency(filteredTotals.balance)}</strong>
+                        {isCardFilterActive ? (
+                          <>
+                            · Total da Fatura (Despesas): <strong className="text-rose-400">{formatCurrency(filteredTotals.expense)}</strong>
+                            {filteredTotals.transfers > 0 && (
+                              <span className="ml-2 text-slate-400">
+                                (Pagamentos anteriores: <span className="text-emerald-400 font-semibold">{formatCurrency(filteredTotals.transfers)}</span>)
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <>
+                            · Total do filtro: <strong className={filteredTotals.balance >= 0 ? "text-emerald-400" : "text-rose-400"}>{formatCurrency(filteredTotals.balance)}</strong>
+                          </>
+                        )}
                       </span>
                     )}
                   </p>
