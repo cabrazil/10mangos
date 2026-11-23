@@ -1,0 +1,1102 @@
+// =============================================================================
+//  10mangos — Controle Financeiro Pessoal
+//  Banco: PostgreSQL (compatível com Supabase)
+//
+//  CONVENÇÕES IMPORTANTES
+//  ----------------------------------------------------------------------------
+//  1. Valores monetários: Decimal(15,2). Nunca usar Float para dinheiro.
+//  2. Sinal do valor (Transaction.amount):
+//       positivo  (+) = entrada / crédito na conta
+//       negativo  (-) = saída   / débito  na conta
+//     Assim: saldo = saldoInicial + SUM(amount). Em cartão de crédito o saldo
+//     negativo representa a dívida (fatura em aberto).
+//  3. Status do lançamento:
+//       PENDING    = previsto/agendado (entra só no saldo PROJETADO)
+//       CLEARED    = efetivado         (entra no saldo ATUAL)
+//       RECONCILED = conciliado com o extrato (entra no saldo ATUAL)
+//  4. Datas "de mês" (month / referenceMonth) são sempre o dia 1 do mês.
+//  5. Transferências = 2 lançamentos (saída + entrada) ligados por Transfer.
+//     Pagamento de fatura de cartão é uma transferência conta -> cartão.
+//  6. Multiusuário: os dados pertencem a um Workspace (workspaceId), não ao
+//     usuário. Usuários acessam workspaces via WorkspaceMember (com papel).
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL") // Supabase: conexão direta p/ migrations
+}
+
+// =============================================================================
+//  ENUMS
+// =============================================================================
+
+enum AccountType {
+  CHECKING // Conta corrente
+  SAVINGS // Poupança
+  INVESTMENT // Conta de investimento / corretora
+  CREDIT_CARD // Cartão de crédito
+  CASH // Dinheiro em espécie / carteira
+  DIGITAL_WALLET // Carteira digital (PicPay, Mercado Pago...)
+  OTHER
+}
+
+enum InvestmentType {
+  FIXED_INCOME // Renda fixa (CDB, LCI, Tesouro...)
+  VARIABLE_INCOME // Renda variável (ações, FIIs, ETFs)
+  FUNDS // Fundos de investimento
+  PENSION // Previdência privada
+  CRYPTO
+  OTHER
+}
+
+enum CategoryType {
+  INCOME // Receita
+  EXPENSE // Despesa
+}
+
+enum TransactionType {
+  INCOME // Receita
+  EXPENSE // Despesa
+  TRANSFER // Transferência entre contas (inclui pagamento de fatura)
+  ADJUSTMENT // Ajuste de saldo (correção manual / rendimento não categorizado)
+}
+
+enum TransactionStatus {
+  PENDING // Previsto / agendado
+  CLEARED // Efetivado
+  RECONCILED // Conciliado com extrato
+}
+
+enum TransactionSource {
+  MANUAL
+  OFX_IMPORT
+  EXCEL_IMPORT
+  RECURRING
+  INSTALLMENT
+  API
+}
+
+enum InvoiceStatus {
+  FUTURE // Fatura futura (criada para receber parcelas previstas)
+  OPEN // Aberta (recebendo compras)
+  CLOSED // Fechada, aguardando pagamento
+  PARTIALLY_PAID
+  PAID
+  OVERDUE // Vencida
+}
+
+enum TransferKind {
+  TRANSFER // Transferência comum entre contas
+  INVOICE_PAYMENT // Pagamento de fatura (conta -> cartão)
+  INVESTMENT_DEPOSIT // Aplicação (conta -> investimento)
+  INVESTMENT_WITHDRAWAL // Resgate (investimento -> conta)
+}
+
+enum InstallmentPlanStatus {
+  ACTIVE // Parcelas em andamento
+  FINISHED // Todas as parcelas lançadas e efetivadas
+  PREPAID // Quitado antecipadamente
+  CANCELED // Compra cancelada/estornada (parcelas futuras removidas)
+}
+
+enum Frequency {
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  BIMONTHLY
+  QUARTERLY
+  SEMIANNUAL
+  ANNUAL
+}
+
+enum ImportSource {
+  OFX
+  EXCEL
+  CSV
+}
+
+enum ImportStatus {
+  UPLOADED
+  PROCESSING
+  AWAITING_REVIEW // Linhas em staging aguardando revisão do usuário
+  COMPLETED
+  FAILED
+  REVERTED // Importação desfeita
+}
+
+enum ImportRowStatus {
+  PENDING // Lida, ainda não analisada
+  SUGGESTED // Há sugestão automática de vínculo com lançamento existente (aguarda confirmação)
+  READY // Sem correspondência: será criado um lançamento novo
+  MATCHED // Vinculada (confirmado) a lançamento(s) já existente(s)
+  IMPORTED // Gerou um lançamento novo
+  DUPLICATE // Linha já importada antes (mesmo FITID/hash) — ex.: OFX com períodos sobrepostos
+  IGNORED // Usuário optou por ignorar
+  ERROR // Falha de parsing/validação
+}
+
+enum MatchMethod {
+  FITID // Mesmo FITID já gravado no lançamento
+  AUTO_EXACT // Mesmo valor + mesma data
+  AUTO_FUZZY // Mesmo valor, data dentro da tolerância e/ou descrição parecida
+  MANUAL // Usuário vinculou manualmente
+  CREATED // Lançamento criado a partir da linha do extrato
+}
+
+enum ReconciliationStatus {
+  IN_PROGRESS
+  COMPLETED
+  CANCELED
+}
+
+enum ExcelAmountMode {
+  SINGLE_SIGNED // Uma coluna com valor positivo/negativo
+  DEBIT_CREDIT_COLS // Colunas separadas de débito e crédito
+  AMOUNT_AND_TYPE // Coluna de valor + coluna indicando D/C
+}
+
+enum RuleMatchField {
+  DESCRIPTION
+  MEMO
+  PAYEE
+}
+
+enum RuleMatchType {
+  CONTAINS
+  STARTS_WITH
+  ENDS_WITH
+  EQUALS
+  REGEX
+}
+
+// =============================================================================
+//  MULTIUSUÁRIO
+//  Workspace = "espaço financeiro" (tenant). TODOS os dados financeiros
+//  pertencem a um workspace, não a um usuário.
+//    - Uso pessoal: 1 workspace com 1 membro (OWNER).
+//    - Família/casal: 1 workspace com vários membros.
+//    - Um usuário pode participar de vários workspaces (ex.: pessoal + empresa MEI).
+//  REGRA DE OURO no backend: toda query filtra por workspaceId do contexto,
+//  depois de validar que o usuário é membro (WorkspaceMember).
+// =============================================================================
+
+enum WorkspaceRole {
+  OWNER // Tudo, inclusive excluir o workspace e gerenciar membros
+  ADMIN // Tudo, exceto excluir o workspace / transferir propriedade
+  MEMBER // Lança, importa, edita lançamentos; não altera configurações
+  VIEWER // Somente leitura (ex.: contador, planejador financeiro)
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+model Workspace {
+  id            String   @id @default(uuid()) @db.Uuid
+  name          String // ex.: "Finanças pessoais", "Casa"
+  slug          String   @unique
+  currency      String   @default("BRL") @db.Char(3)
+  locale        String   @default("pt-BR")
+  timezone      String   @default("America/Sao_Paulo")
+  // Dia de início do "mês financeiro" (ex.: 5 = quem recebe salário no dia 5)
+  monthStartDay Int      @default(1)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  members               WorkspaceMember[]
+  invites               WorkspaceInvite[]
+  bankReconciliations   BankReconciliation[]
+  reconciliationMatches ReconciliationMatch[]
+
+  accounts               Account[]
+  categories             Category[]
+  transactions           Transaction[]
+  transfers              Transfer[]
+  payees                 Payee[]
+  tags                   Tag[]
+  categorizationRules    CategorizationRule[]
+  installmentPlans       InstallmentPlan[]
+  recurringRules         RecurringRule[]
+  budgets                Budget[]
+  invoices               CreditCardInvoice[]
+  importBatches          ImportBatch[]
+  importRows             ImportRow[]
+  importTemplates        ImportTemplate[]
+  accountMonthlyBalances AccountMonthlyBalance[]
+  categorySummaries      CategoryMonthlySummary[]
+  monthlySummaries       MonthlySummary[]
+
+  @@map("workspaces")
+}
+
+model User {
+  id                 String    @id @default(uuid()) @db.Uuid // se usar Supabase Auth: mesmo id de auth.users
+  name               String
+  email              String    @unique
+  passwordHash       String? // null se login apenas via OAuth/magic link
+  avatarUrl          String?
+  emailVerifiedAt    DateTime?
+  lastLoginAt        DateTime?
+  isActive           Boolean   @default(true)
+  locale             String    @default("pt-BR")
+  // Workspace aberto por padrão ao fazer login
+  defaultWorkspaceId String?   @db.Uuid
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  memberships              WorkspaceMember[]
+  startedReconciliations   BankReconciliation[]  @relation("ReconciliationStartedBy")
+  completedReconciliations BankReconciliation[]  @relation("ReconciliationCompletedBy")
+  confirmedMatches         ReconciliationMatch[] @relation("MatchConfirmedBy")
+  sentInvites              WorkspaceInvite[]     @relation("InviteSentBy")
+  heldAccounts             Account[]             @relation("AccountHolder")
+  createdTransactions      Transaction[]         @relation("TransactionCreatedBy")
+  updatedTransactions      Transaction[]         @relation("TransactionUpdatedBy")
+  importBatches            ImportBatch[]         @relation("ImportCreatedBy")
+
+  @@map("users")
+}
+
+model WorkspaceMember {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @db.Uuid
+  userId      String        @db.Uuid
+  role        WorkspaceRole @default(MEMBER)
+  joinedAt    DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@map("workspace_members")
+}
+
+model WorkspaceInvite {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @db.Uuid
+  email       String
+  role        WorkspaceRole @default(MEMBER)
+  tokenHash   String        @unique // guardar só o hash do token enviado por e-mail
+  status      InviteStatus  @default(PENDING)
+  invitedById String?       @db.Uuid
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy User?     @relation("InviteSentBy", fields: [invitedById], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, status])
+  @@index([email])
+  @@map("workspace_invites")
+}
+
+// =============================================================================
+//  CONTAS (corrente, poupança, investimento, cartão de crédito, carteira)
+// =============================================================================
+
+model Account {
+  id          String      @id @default(uuid()) @db.Uuid
+  workspaceId String      @db.Uuid
+  name        String
+  type        AccountType
+  currency    String      @default("BRL") @db.Char(3)
+
+  // --- Dados bancários (também usados para casar arquivos OFX) ---
+  institutionName String?
+  bankCode        String? // Código COMPE (ex.: 341, 001, 260)
+  branch          String? // Agência
+  accountNumber   String?
+  ofxBankId       String? // <BANKID> do OFX
+  ofxAccountId    String? // <ACCTID> do OFX
+
+  // --- Saldos (mantidos por trigger — ver prisma/sql/balance_triggers.sql) ---
+  initialBalance         Decimal   @default(0) @db.Decimal(15, 2)
+  initialBalanceDate     DateTime  @default(now()) @db.Date
+  currentBalance         Decimal   @default(0) @db.Decimal(15, 2) // CLEARED + RECONCILED
+  projectedBalance       Decimal   @default(0) @db.Decimal(15, 2) // inclui PENDING
+  lastReconciledBalance  Decimal?  @db.Decimal(15, 2)
+  lastReconciledAt       DateTime?
+  lastReconciledDate     DateTime? @db.Date // data final do último extrato conciliado
+  // Conciliação: tolerância (dias) entre a data do lançamento e a do extrato p/ sugerir vínculo
+  matchDateToleranceDays Int       @default(3)
+
+  // --- Cartão de crédito ---
+  creditLimit    Decimal? @db.Decimal(15, 2)
+  closingDay     Int? // Dia de fechamento da fatura (1-31)
+  dueDay         Int? // Dia de vencimento da fatura (1-31)
+  cardBrand      String? // Visa, Mastercard, Elo...
+  lastFourDigits String?  @db.Char(4)
+
+  // --- Titular (multiusuário: de quem é a conta dentro do workspace) ---
+  holderUserId     String? @db.Uuid
+  paymentAccountId String? @db.Uuid // Conta padrão para pagar a fatura
+
+  // --- Investimento ---
+  investmentType InvestmentType?
+
+  // --- Exibição / comportamento ---
+  includeInTotals Boolean @default(true) // Soma no patrimônio / dashboard
+  isArchived      Boolean @default(false)
+  color           String?
+  icon            String?
+  displayOrder    Int     @default(0)
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace      Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  holder         User?     @relation("AccountHolder", fields: [holderUserId], references: [id], onDelete: SetNull)
+  paymentAccount Account?  @relation("CardPaymentAccount", fields: [paymentAccountId], references: [id], onDelete: SetNull)
+  paidCards      Account[] @relation("CardPaymentAccount")
+
+  transactions         Transaction[]
+  invoices             CreditCardInvoice[]
+  installmentPlans     InstallmentPlan[]
+  recurringRules       RecurringRule[]         @relation("RecurringAccount")
+  recurringTransfersIn RecurringRule[]         @relation("RecurringTransferTo")
+  categorizationRules  CategorizationRule[]
+  importBatches        ImportBatch[]
+  importTemplates      ImportTemplate[]
+  monthlyBalances      AccountMonthlyBalance[]
+  bankReconciliations  BankReconciliation[]
+
+  @@unique([workspaceId, name])
+  @@unique([workspaceId, ofxBankId, ofxAccountId])
+  @@index([workspaceId, type])
+  @@map("accounts")
+}
+
+// =============================================================================
+//  CATEGORIAS E SUBCATEGORIAS (hierarquia em 2 níveis via parentId)
+// =============================================================================
+
+model Category {
+  id               String       @id @default(uuid()) @db.Uuid
+  workspaceId      String       @db.Uuid
+  parentId         String?      @db.Uuid // null = categoria; preenchido = subcategoria
+  name             String
+  type             CategoryType // Subcategoria deve ter o mesmo tipo da categoria pai
+  color            String?
+  icon             String?
+  displayOrder     Int          @default(0)
+  isArchived       Boolean      @default(false)
+  includeInReports Boolean      @default(true) // ex.: "Reembolsos" pode ficar fora
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  workspace Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  parent    Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children  Category[] @relation("CategoryTree")
+
+  transactions        Transaction[]
+  splits              TransactionSplit[]
+  payees              Payee[]
+  categorizationRules CategorizationRule[]
+  installmentPlans    InstallmentPlan[]
+  recurringRules      RecurringRule[]
+  budgets             Budget[]
+  monthlySummaries    CategoryMonthlySummary[]
+  suggestedImportRows ImportRow[]
+
+  @@unique([workspaceId, type, parentId, name])
+  @@index([workspaceId, type])
+  @@index([parentId])
+  @@map("categories")
+}
+
+// =============================================================================
+//  FAVORECIDOS (facilita auto-categorização e relatórios por estabelecimento)
+// =============================================================================
+
+model Payee {
+  id                String   @id @default(uuid()) @db.Uuid
+  workspaceId       String   @db.Uuid
+  name              String
+  document          String? // CPF/CNPJ
+  defaultCategoryId String?  @db.Uuid
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  workspace       Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  defaultCategory Category? @relation(fields: [defaultCategoryId], references: [id], onDelete: SetNull)
+
+  transactions        Transaction[]
+  categorizationRules CategorizationRule[]
+  recurringRules      RecurringRule[]
+  installmentPlans    InstallmentPlan[]
+  suggestedImportRows ImportRow[]
+
+  @@unique([workspaceId, name])
+  @@map("payees")
+}
+
+model Tag {
+  id          String   @id @default(uuid()) @db.Uuid
+  workspaceId String   @db.Uuid
+  name        String
+  color       String?
+  createdAt   DateTime @default(now())
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  transactions Transaction[] // relação N:N implícita (ex.: "Viagem 2026", "Reforma")
+
+  @@unique([workspaceId, name])
+  @@map("tags")
+}
+
+// =============================================================================
+//  LANÇAMENTOS
+// =============================================================================
+
+model Transaction {
+  id          String            @id @default(uuid()) @db.Uuid
+  workspaceId String            @db.Uuid
+  accountId   String            @db.Uuid
+  type        TransactionType
+  status      TransactionStatus @default(CLEARED)
+  source      TransactionSource @default(MANUAL)
+  createdById String?           @db.Uuid // usuário que lançou (auditoria)
+  updatedById String?           @db.Uuid
+
+  amount         Decimal   @db.Decimal(15, 2) // COM SINAL: + entrada / - saída
+  date           DateTime  @db.Date // Data do lançamento (caixa / compra). Se PENDING = data prevista
+  competenceDate DateTime? @db.Date // Competência (ex.: conta de luz de out/26 paga em nov/26)
+  confirmedAt    DateTime? // Quando o previsto (PENDING) foi efetivado
+  clearedDate    DateTime? @db.Date // Data em que compensou no banco (extrato) — pode diferir de date
+
+  description         String
+  originalDescription String? // Texto bruto vindo do OFX/Excel (preservado p/ regras)
+  notes               String?
+  checkNumber         String?
+
+  categoryId String? @db.Uuid // null quando é transferência ou quando isSplit = true
+  payeeId    String? @db.Uuid
+  isSplit    Boolean @default(false) // true => usar TransactionSplit para categorias
+
+  // Cartão de crédito: fatura à qual a compra/parcela/estorno pertence.
+  // Pagamentos de fatura NÃO usam este campo — usam Transfer.invoiceId.
+  invoiceId String? @db.Uuid
+
+  // Parcelamento (ex.: 3/10)
+  installmentPlanId String? @db.Uuid
+  installmentNumber Int?
+
+  // Recorrência que gerou este lançamento
+  recurringRuleId String? @db.Uuid
+
+  // Importação / deduplicação
+  importBatchId String? @db.Uuid
+  fitId         String? // <FITID> do OFX — único por conta
+  importHash    String? // hash(data|valor|descrição) p/ Excel/CSV sem id
+
+  // Conciliação bancária
+  reconciliationId String?   @db.Uuid // conciliação que fechou este lançamento
+  reconciledAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace       Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy       User?              @relation("TransactionCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy       User?              @relation("TransactionUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  account         Account            @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  category        Category?          @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  payee           Payee?             @relation(fields: [payeeId], references: [id], onDelete: SetNull)
+  invoice         CreditCardInvoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  installmentPlan InstallmentPlan?   @relation(fields: [installmentPlanId], references: [id], onDelete: Cascade)
+  recurringRule   RecurringRule?     @relation(fields: [recurringRuleId], references: [id], onDelete: SetNull)
+  importBatch     ImportBatch?       @relation(fields: [importBatchId], references: [id], onDelete: SetNull)
+
+  splits       TransactionSplit[]
+  tags         Tag[]
+  transferFrom Transfer?          @relation("TransferFrom")
+  transferTo   Transfer?          @relation("TransferTo")
+
+  reconciliation        BankReconciliation?   @relation(fields: [reconciliationId], references: [id], onDelete: SetNull)
+  reconciliationMatches ReconciliationMatch[] // linhas do extrato vinculadas
+
+  @@unique([accountId, fitId])
+  @@unique([accountId, importHash])
+  @@unique([installmentPlanId, installmentNumber])
+  @@index([workspaceId, date])
+  @@index([createdById])
+  @@index([accountId, date])
+  @@index([accountId, status])
+  @@index([categoryId, date])
+  @@index([workspaceId, competenceDate])
+  @@index([invoiceId])
+  @@index([installmentPlanId])
+  @@index([importBatchId])
+  @@index([reconciliationId])
+  @@index([accountId, clearedDate])
+  @@map("transactions")
+}
+
+// Divisão de um lançamento em várias categorias
+// (ex.: compra de R$ 300 no mercado = R$ 250 Alimentação + R$ 50 Limpeza)
+// A soma dos splits deve ser igual a Transaction.amount.
+model TransactionSplit {
+  id            String   @id @default(uuid()) @db.Uuid
+  transactionId String   @db.Uuid
+  categoryId    String   @db.Uuid
+  amount        Decimal  @db.Decimal(15, 2) // mesmo sinal do lançamento
+  description   String?
+  createdAt     DateTime @default(now())
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  category    Category    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@index([transactionId])
+  @@index([categoryId])
+  @@map("transaction_splits")
+}
+
+// Transferência entre contas: liga o lançamento de saída ao de entrada.
+// Pagamento de fatura = transferência (corrente -> cartão), com invoiceId.
+// Aplicação/resgate = transferência (corrente <-> investimento).
+//
+// PREVISÃO: uma transferência agendada é criada com os DOIS lançamentos em
+// status PENDING (afetam só o saldo projetado das duas contas). Ao efetivar,
+// ambos passam para CLEARED na mesma transação de banco.
+model Transfer {
+  id                String       @id @default(uuid()) @db.Uuid
+  workspaceId       String       @db.Uuid
+  kind              TransferKind @default(TRANSFER)
+  fromTransactionId String       @unique @db.Uuid // amount negativo
+  toTransactionId   String       @unique @db.Uuid // amount positivo
+  amount            Decimal      @db.Decimal(15, 2) // valor absoluto
+  date              DateTime     @db.Date // data efetiva ou prevista
+  description       String?
+  invoiceId         String?      @db.Uuid // kind = INVOICE_PAYMENT
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  workspace       Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  fromTransaction Transaction        @relation("TransferFrom", fields: [fromTransactionId], references: [id], onDelete: Cascade)
+  toTransaction   Transaction        @relation("TransferTo", fields: [toTransactionId], references: [id], onDelete: Cascade)
+  invoice         CreditCardInvoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, date])
+  @@index([invoiceId])
+  @@map("transfers")
+}
+
+// =============================================================================
+//  CARTÃO DE CRÉDITO — FATURAS
+// =============================================================================
+
+model CreditCardInvoice {
+  id             String        @id @default(uuid()) @db.Uuid
+  workspaceId    String        @db.Uuid
+  accountId      String        @db.Uuid // conta do tipo CREDIT_CARD
+  referenceMonth DateTime      @db.Date // dia 1 do mês da fatura (vencimento)
+  closingDate    DateTime      @db.Date
+  dueDate        DateTime      @db.Date
+  // totalAmount = -(SUM(transactions.amount)) => compras/parcelas menos estornos (inclui parcelas PENDING)
+  // paidAmount  = SUM(payments.amount) com lançamento efetivado
+  // Ambos mantidos por trigger (ver prisma/sql/balance_triggers.sql)
+  totalAmount    Decimal       @default(0) @db.Decimal(15, 2)
+  paidAmount     Decimal       @default(0) @db.Decimal(15, 2)
+  status         InvoiceStatus @default(OPEN)
+  closedAt       DateTime?
+  paidAt         DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  account      Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  transactions Transaction[] // compras, parcelas, estornos, encargos
+  payments     Transfer[] // pagamentos (efetivados e previstos)
+
+  @@unique([accountId, referenceMonth])
+  @@index([accountId, status])
+  @@index([dueDate])
+  @@index([workspaceId, dueDate])
+  @@map("credit_card_invoices")
+}
+
+// =============================================================================
+//  PARCELAMENTOS E RECORRÊNCIAS
+// =============================================================================
+
+// Compra parcelada: gera TODAS as N parcelas de uma vez como lançamentos.
+//  - Cartão: cada parcela vai para a fatura do mês correspondente
+//    (faturas futuras são criadas com status FUTURE). A parcela da fatura
+//    atual nasce CLEARED; as futuras nascem PENDING e são efetivadas quando
+//    a fatura delas abre/fecha.
+//  - Outras contas (carnê, boleto, financiamento): mesmas regras, sem fatura.
+// Assim o saldo PROJETADO do cartão já reflete todo o valor comprometido
+// e o limite disponível = creditLimit + projectedBalance.
+model InstallmentPlan {
+  id          String                @id @default(uuid()) @db.Uuid
+  workspaceId String                @db.Uuid
+  accountId   String                @db.Uuid
+  categoryId  String?               @db.Uuid
+  payeeId     String?               @db.Uuid
+  description String
+  status      InstallmentPlanStatus @default(ACTIVE)
+
+  purchaseDate           DateTime @db.Date // data da compra
+  firstDueMonth          DateTime @db.Date // dia 1 do mês da 1ª parcela (fatura de referência)
+  installmentCount       Int
+  installmentAmount      Decimal  @db.Decimal(15, 2) // valor da parcela (positivo)
+  totalAmount            Decimal  @db.Decimal(15, 2) // soma das parcelas (positivo)
+  // Diferença de arredondamento (R$ 100 / 3) vai para a 1ª parcela
+  firstInstallmentAmount Decimal? @db.Decimal(15, 2)
+
+  // Juros (parcelado "com juros" / financiamentos)
+  hasInterest     Boolean  @default(false)
+  cashPrice       Decimal? @db.Decimal(15, 2) // preço à vista
+  monthlyInterest Decimal? @db.Decimal(7, 4) // taxa mensal (ex.: 0.0299 = 2,99%)
+
+  // Situação (atualizada pelo serviço ao efetivar/antecipar parcelas)
+  paidInstallments Int       @default(0)
+  remainingAmount  Decimal   @db.Decimal(15, 2)
+  lastDueMonth     DateTime  @db.Date // dia 1 do mês da última parcela
+  canceledAt       DateTime?
+
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account      Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  category     Category?     @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  payee        Payee?        @relation(fields: [payeeId], references: [id], onDelete: SetNull)
+  transactions Transaction[]
+
+  @@index([workspaceId, status])
+  @@index([accountId, lastDueMonth])
+  @@map("installment_plans")
+}
+
+// Contas fixas / receitas recorrentes (aluguel, salário, assinaturas...)
+// e TRANSFERÊNCIAS PROGRAMADAS (ex.: todo dia 5 aplicar R$ 500 no investimento).
+// Um job diário cria os próximos lançamentos como PENDING (previstos).
+// type = TRANSFER: accountId = origem, transferToAccountId = destino; gera um
+// Transfer com dois lançamentos PENDING a cada ocorrência.
+model RecurringRule {
+  id                  String          @id @default(uuid()) @db.Uuid
+  workspaceId         String          @db.Uuid
+  accountId           String          @db.Uuid // conta (ou origem, se transferência)
+  transferToAccountId String?         @db.Uuid // destino (somente type = TRANSFER)
+  transferKind        TransferKind?
+  categoryId          String?         @db.Uuid
+  payeeId             String?         @db.Uuid
+  type                TransactionType
+  description         String
+  amount              Decimal         @db.Decimal(15, 2) // com sinal
+  frequency           Frequency       @default(MONTHLY)
+  interval            Int             @default(1) // a cada N períodos
+  dayOfMonth          Int?
+  startDate           DateTime        @db.Date
+  endDate             DateTime?       @db.Date
+  occurrencesLimit    Int?
+  occurrencesCount    Int             @default(0)
+  nextOccurrence      DateTime        @db.Date
+  daysInAdvance       Int             @default(30) // gerar previstos com X dias de antecedência
+  autoConfirm         Boolean         @default(false) // já cria como CLEARED (ex.: débito automático)
+  isActive            Boolean         @default(true)
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  workspace         Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account           Account       @relation("RecurringAccount", fields: [accountId], references: [id], onDelete: Cascade)
+  transferToAccount Account?      @relation("RecurringTransferTo", fields: [transferToAccountId], references: [id], onDelete: Cascade)
+  category          Category?     @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  payee             Payee?        @relation(fields: [payeeId], references: [id], onDelete: SetNull)
+  transactions      Transaction[]
+
+  @@index([workspaceId, isActive, nextOccurrence])
+  @@map("recurring_rules")
+}
+
+// =============================================================================
+//  ORÇAMENTO (planejado x realizado)
+// =============================================================================
+
+model Budget {
+  id             String   @id @default(uuid()) @db.Uuid
+  workspaceId    String   @db.Uuid
+  categoryId     String   @db.Uuid
+  month          DateTime @db.Date // dia 1 do mês
+  plannedAmount  Decimal  @db.Decimal(15, 2) // valor absoluto
+  alertThreshold Int?     @default(80) // % para alertar (ex.: 80%)
+  rollover       Boolean  @default(false) // saldo não usado passa p/ o mês seguinte
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  category  Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, categoryId, month])
+  @@map("budgets")
+}
+
+// =============================================================================
+//  REGRAS DE AUTO-CATEGORIZAÇÃO (usadas na importação e no lançamento manual)
+// =============================================================================
+
+model CategorizationRule {
+  id            String         @id @default(uuid()) @db.Uuid
+  workspaceId   String         @db.Uuid
+  name          String
+  priority      Int            @default(100) // menor = avaliada primeiro
+  matchField    RuleMatchField @default(DESCRIPTION)
+  matchType     RuleMatchType  @default(CONTAINS)
+  pattern       String // ex.: "UBER", "IFOOD", "^PIX RECEBIDO.*SALARIO"
+  caseSensitive Boolean        @default(false)
+
+  // Condições opcionais
+  accountId String?  @db.Uuid
+  amountMin Decimal? @db.Decimal(15, 2)
+  amountMax Decimal? @db.Decimal(15, 2)
+
+  // Ações
+  categoryId     String? @db.Uuid
+  payeeId        String? @db.Uuid
+  setDescription String? // renomeia "PAG*JOSESILVA 123" -> "Padaria do José"
+
+  isActive      Boolean   @default(true)
+  timesApplied  Int       @default(0)
+  lastAppliedAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account   Account?  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  category  Category? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  payee     Payee?    @relation(fields: [payeeId], references: [id], onDelete: SetNull)
+
+  matchedImportRows ImportRow[]
+
+  @@index([workspaceId, isActive, priority])
+  @@map("categorization_rules")
+}
+
+// =============================================================================
+//  IMPORTAÇÃO (OFX / Excel / CSV) — com área de staging para revisão
+// =============================================================================
+
+model ImportBatch {
+  id          String       @id @default(uuid()) @db.Uuid
+  workspaceId String       @db.Uuid
+  accountId   String?      @db.Uuid // definido pelo usuário ou casado via BANKID/ACCTID
+  templateId  String?      @db.Uuid // Excel: layout usado
+  source      ImportSource
+  createdById String?      @db.Uuid // usuário que importou
+  status      ImportStatus @default(UPLOADED)
+
+  fileName  String
+  fileHash  String // SHA-256 do arquivo — avisa se o mesmo arquivo já foi importado
+  fileSize  Int?
+  sheetName String? // Excel
+
+  periodStart DateTime? @db.Date // OFX: <DTSTART>
+  periodEnd   DateTime? @db.Date // OFX: <DTEND>
+
+  // Dados de saldo do OFX — permitem conciliar automaticamente
+  ofxBankId           String?
+  ofxAccountId        String?
+  ofxLedgerBalance    Decimal?  @db.Decimal(15, 2) // <LEDGERBAL><BALAMT>
+  ofxBalanceDate      DateTime? // <LEDGERBAL><DTASOF>
+  ofxAvailableBalance Decimal?  @db.Decimal(15, 2) // <AVAILBAL><BALAMT>
+  ofxCurrency         String?   @db.Char(3) // <CURDEF>
+
+  totalRows     Int   @default(0)
+  importedRows  Int   @default(0)
+  duplicateRows Int   @default(0)
+  ignoredRows   Int   @default(0)
+  errorRows     Int   @default(0)
+  errors        Json?
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+  revertedAt  DateTime?
+
+  workspace       Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy       User?                @relation("ImportCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  account         Account?             @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  template        ImportTemplate?      @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  rows            ImportRow[]
+  reconciliations BankReconciliation[]
+  transactions    Transaction[]
+
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, fileHash])
+  @@map("import_batches")
+}
+
+// Cada linha do arquivo, normalizada, antes de virar lançamento
+// Cada linha do arquivo importado. Para OFX, funciona como LINHA DO EXTRATO
+// BANCÁRIO e fica guardada permanentemente (lado "banco" da conciliação).
+// O vínculo com os lançamentos (lado "sistema") é feito em ReconciliationMatch,
+// permitindo 1:1, 1:N (um débito no banco = vários lançamentos) e N:1.
+model ImportRow {
+  id          String          @id @default(uuid()) @db.Uuid
+  workspaceId String          @db.Uuid
+  batchId     String          @db.Uuid
+  rowNumber   Int
+  status      ImportRowStatus @default(PENDING)
+  rawData     Json // linha original (STMTTRN do OFX ou linha do Excel)
+
+  // Dados normalizados
+  date                DateTime? @db.Date // <DTPOSTED>
+  amount              Decimal?  @db.Decimal(15, 2) // já com sinal correto (<TRNAMT>)
+  description         String? // <MEMO> ou coluna de descrição
+  payeeName           String? // <NAME>
+  memo                String?
+  bankTransactionType String? // <TRNTYPE>: CREDIT, DEBIT, XFER, PAYMENT, FEE...
+  fitId               String? // <FITID>
+  checkNumber         String? // <CHECKNUM>
+  hash                String? // mesmo cálculo de Transaction.importHash
+
+  // Sugestões de categorização (regras / histórico) para linhas que virarão lançamento
+  suggestedCategoryId String? @db.Uuid
+  suggestedPayeeId    String? @db.Uuid
+  matchedRuleId       String? @db.Uuid
+
+  // Quanto do valor já está vinculado (soma de ReconciliationMatch.amount)
+  matchedAmount Decimal @default(0) @db.Decimal(15, 2)
+  errorMessage  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  batch             ImportBatch           @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  workspace         Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  suggestedCategory Category?             @relation(fields: [suggestedCategoryId], references: [id], onDelete: SetNull)
+  suggestedPayee    Payee?                @relation(fields: [suggestedPayeeId], references: [id], onDelete: SetNull)
+  matchedRule       CategorizationRule?   @relation(fields: [matchedRuleId], references: [id], onDelete: SetNull)
+  matches           ReconciliationMatch[]
+
+  @@unique([batchId, rowNumber])
+  @@index([batchId, status])
+  @@index([workspaceId, fitId])
+  @@index([workspaceId, date, amount])
+  @@map("import_rows")
+}
+
+// Layout salvo de planilha (cada banco/cartão exporta de um jeito)
+model ImportTemplate {
+  id          String  @id @default(uuid()) @db.Uuid
+  workspaceId String  @db.Uuid
+  accountId   String? @db.Uuid // conta padrão para esse layout
+  name        String // ex.: "Fatura Nubank (xlsx)"
+
+  sheetName    String? // null = primeira aba
+  headerRow    Int     @default(1)
+  firstDataRow Int     @default(2)
+
+  // Mapeamento de colunas, ex.:
+  // { "date": "A", "description": "B", "amount": "D", "category": "C",
+  //   "debit": "E", "credit": "F", "type": "G", "installment": "H" }
+  columnMapping Json
+
+  dateFormat       String          @default("dd/MM/yyyy")
+  decimalSeparator String          @default(",") @db.Char(1)
+  amountMode       ExcelAmountMode @default(SINGLE_SIGNED)
+  invertSign       Boolean         @default(false) // faturas costumam vir com compras positivas
+  debitIndicator   String? // AMOUNT_AND_TYPE: valor que indica débito (ex.: "D")
+  skipPatterns     String[] // descrições a ignorar (ex.: "SALDO ANTERIOR")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account   Account?      @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  batches   ImportBatch[]
+
+  @@unique([workspaceId, name])
+  @@map("import_templates")
+}
+
+// =============================================================================
+//  CONCILIAÇÃO BANCÁRIA
+//
+//  Fluxo:
+//   1. Importa o OFX  -> ImportBatch + ImportRow (linhas do extrato).
+//   2. Matching automático para cada linha (na ordem):
+//        a) FITID já existe em Transaction da conta      -> DUPLICATE
+//        b) Lançamento CLEARED/PENDING sem vínculo, mesmo valor e mesma data
+//           -> AUTO_EXACT;  data dentro de Account.matchDateToleranceDays -> AUTO_FUZZY
+//           (status da linha: SUGGESTED)
+//        c) Sem correspondência -> READY (vai criar lançamento novo, usando
+//           CategorizationRule para sugerir categoria/favorecido)
+//   3. Usuário revisa: confirma/troca vínculos, ignora linhas, ajusta categorias.
+//   4. Ao confirmar:
+//        - linhas vinculadas: grava fitId e clearedDate no lançamento;
+//          lançamento PENDING passa a CLEARED
+//        - linhas READY: cria Transaction (source = OFX_IMPORT) + match CREATED
+//   5. Fecha a conciliação (BankReconciliation): se saldo do extrato
+//      (<LEDGERBAL>) == saldo do sistema na data final, os lançamentos do
+//      período vão para RECONCILED e ficam travados (trigger impede edição).
+// =============================================================================
+
+model BankReconciliation {
+  id            String               @id @default(uuid()) @db.Uuid
+  workspaceId   String               @db.Uuid
+  accountId     String               @db.Uuid
+  importBatchId String?              @db.Uuid // null = conciliação manual contra extrato em papel/PDF
+  status        ReconciliationStatus @default(IN_PROGRESS)
+
+  periodStart DateTime @db.Date
+  periodEnd   DateTime @db.Date
+
+  // Lado banco (extrato)
+  statementOpeningBalance Decimal? @db.Decimal(15, 2)
+  statementClosingBalance Decimal  @db.Decimal(15, 2) // OFX: <LEDGERBAL>
+
+  // Lado sistema (calculado ao fechar)
+  systemOpeningBalance Decimal? @db.Decimal(15, 2)
+  systemClosingBalance Decimal? @db.Decimal(15, 2)
+  difference           Decimal? @db.Decimal(15, 2) // statement - system (deve ser 0 para concluir)
+
+  // Contadores para o resumo da tela
+  matchedCount   Int @default(0)
+  createdCount   Int @default(0)
+  unmatchedBank  Int @default(0) // linhas do extrato sem lançamento
+  unmatchedBooks Int @default(0) // lançamentos do período sem linha no extrato
+
+  // Diferença aceita e lançada como ajuste (opcional)
+  adjustmentTransactionId String? @unique @db.Uuid
+
+  notes         String?
+  startedById   String?   @db.Uuid
+  completedById String?   @db.Uuid
+  completedAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account      Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  importBatch  ImportBatch?  @relation(fields: [importBatchId], references: [id], onDelete: SetNull)
+  startedBy    User?         @relation("ReconciliationStartedBy", fields: [startedById], references: [id], onDelete: SetNull)
+  completedBy  User?         @relation("ReconciliationCompletedBy", fields: [completedById], references: [id], onDelete: SetNull)
+  transactions Transaction[]
+
+  @@index([workspaceId, accountId, periodEnd])
+  @@index([accountId, status])
+  @@map("bank_reconciliations")
+}
+
+// Vínculo linha do extrato <-> lançamento.
+// 1:1 no caso comum; várias linhas para um lançamento ou vice-versa quando
+// necessário (ex.: um saque no banco que o usuário dividiu em 2 lançamentos).
+model ReconciliationMatch {
+  id            String      @id @default(uuid()) @db.Uuid
+  workspaceId   String      @db.Uuid
+  importRowId   String      @db.Uuid
+  transactionId String      @db.Uuid
+  amount        Decimal     @db.Decimal(15, 2) // parte do valor coberta por este vínculo (com sinal)
+  method        MatchMethod
+  score         Decimal?    @db.Decimal(5, 4) // confiança do match automático (0..1)
+  isConfirmed   Boolean     @default(false) // sugestões automáticas nascem false
+  confirmedById String?     @db.Uuid
+  confirmedAt   DateTime?
+  createdAt     DateTime    @default(now())
+
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  importRow   ImportRow   @relation(fields: [importRowId], references: [id], onDelete: Cascade)
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  confirmedBy User?       @relation("MatchConfirmedBy", fields: [confirmedById], references: [id], onDelete: SetNull)
+
+  @@unique([importRowId, transactionId])
+  @@index([transactionId])
+  @@index([workspaceId, isConfirmed])
+  @@map("reconciliation_matches")
+}
+
+// =============================================================================
+//  RESUMOS (tabelas agregadas para relatórios/dashboards rápidos)
+//  Recalculadas por serviço/job sempre que lançamentos de um mês mudam
+//  (recalcular o mês afetado — e os seguintes no caso de saldos).
+// =============================================================================
+
+// Evolução de saldo por conta/mês (extrato mensal resumido / gráfico de patrimônio)
+model AccountMonthlyBalance {
+  id               String   @id @default(uuid()) @db.Uuid
+  workspaceId      String   @db.Uuid
+  accountId        String   @db.Uuid
+  month            DateTime @db.Date // dia 1 do mês
+  openingBalance   Decimal  @default(0) @db.Decimal(15, 2)
+  totalIncome      Decimal  @default(0) @db.Decimal(15, 2) // receitas (+)
+  totalExpense     Decimal  @default(0) @db.Decimal(15, 2) // despesas (valor absoluto)
+  transfersIn      Decimal  @default(0) @db.Decimal(15, 2)
+  transfersOut     Decimal  @default(0) @db.Decimal(15, 2) // valor absoluto
+  adjustments      Decimal  @default(0) @db.Decimal(15, 2) // com sinal
+  closingBalance   Decimal  @default(0) @db.Decimal(15, 2)
+  pendingAmount    Decimal  @default(0) @db.Decimal(15, 2) // previstos ainda não efetivados
+  transactionCount Int      @default(0)
+  updatedAt        DateTime @updatedAt
+
+  account   Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, month])
+  @@index([month])
+  @@index([workspaceId, month])
+  @@map("account_monthly_balances")
+}
+
+// Realizado x orçado por categoria/mês (DRE pessoal, gráfico de pizza, ranking)
+model CategoryMonthlySummary {
+  id               String       @id @default(uuid()) @db.Uuid
+  workspaceId      String       @db.Uuid
+  categoryId       String       @db.Uuid
+  parentCategoryId String?      @db.Uuid // desnormalizado: agrupar por categoria pai sem join recursivo
+  categoryType     CategoryType
+  month            DateTime     @db.Date // dia 1 do mês (base: competenceDate ?? date)
+  actualAmount     Decimal      @default(0) @db.Decimal(15, 2) // valor absoluto realizado
+  pendingAmount    Decimal      @default(0) @db.Decimal(15, 2) // previsto (PENDING)
+  budgetedAmount   Decimal      @default(0) @db.Decimal(15, 2) // cópia do Budget
+  transactionCount Int          @default(0)
+  updatedAt        DateTime     @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  category  Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, categoryId, month])
+  @@index([workspaceId, month, categoryType])
+  @@index([workspaceId, parentCategoryId, month])
+  @@map("category_monthly_summaries")
+}
+
+// Fotografia consolidada do mês (dashboard principal / comparativo anual)
+model MonthlySummary {
+  id             String   @id @default(uuid()) @db.Uuid
+  workspaceId    String   @db.Uuid
+  month          DateTime @db.Date // dia 1 do mês
+  totalIncome    Decimal  @default(0) @db.Decimal(15, 2)
+  totalExpense   Decimal  @default(0) @db.Decimal(15, 2) // valor absoluto
+  netResult      Decimal  @default(0) @db.Decimal(15, 2) // receitas - despesas
+  savingsRate    Decimal? @db.Decimal(7, 4) // netResult / totalIncome
+  totalBudgeted  Decimal  @default(0) @db.Decimal(15, 2)
+  pendingIncome  Decimal  @default(0) @db.Decimal(15, 2)
+  pendingExpense Decimal  @default(0) @db.Decimal(15, 2)
+
+  // Posição patrimonial no fechamento do mês (contas com includeInTotals)
+  cashBalance       Decimal @default(0) @db.Decimal(15, 2) // corrente/poupança/carteira
+  investmentBalance Decimal @default(0) @db.Decimal(15, 2)
+  creditCardDebt    Decimal @default(0) @db.Decimal(15, 2) // valor absoluto
+  netWorth          Decimal @default(0) @db.Decimal(15, 2) // cash + invest - dívida
+
+  updatedAt DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, month])
+  @@map("monthly_summaries")
+}

@@ -1,0 +1,56 @@
+{
+  "name": "10mangos-api",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "API de Controle Financeiro Pessoal - 10mangos",
+  "main": "src/server.ts",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsup src --out-dir dist",
+    "start": "node dist/server.js",
+    "db:migrate": "prisma migrate dev",
+    "db:generate": "prisma generate",
+    "db:studio": "prisma studio",
+    "db:seed": "tsx prisma/seed.ts",
+    "import:csv": "tsx src/scripts/import-organizze-csv.ts",
+    "import:ofx": "tsx src/scripts/import-ofx.ts",
+    "check:itau": "tsx src/scripts/check-itau.ts",
+    "db:reset-tx": "tsx src/scripts/reset-transactions.ts",
+    "set:balance": "tsx src/scripts/set-initial-balance.ts",
+    "recalculate": "tsx src/scripts/recalculate-balances.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "keywords": [
+    "finance",
+    "fastify",
+    "prisma",
+    "postgresql"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@fastify/cors": "^11.4.3",
+    "@fastify/jwt": "^10.2.8",
+    "@fastify/multipart": "^10.1.9",
+    "@fastify/swagger": "^9.9.5",
+    "@fastify/swagger-ui": "^6.1.5",
+    "@prisma/client": "^6.19.3",
+    "bcryptjs": "^3.0.3",
+    "date-fns": "^4.4.0",
+    "dotenv": "^18.0.10",
+    "fastify": "^5.12.8",
+    "fastify-type-provider-zod": "^7.0.0",
+    "xlsx": "^0.18.5",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^26.6.6",
+    "prisma": "^6.19.3",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

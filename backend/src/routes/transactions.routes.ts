@@ -1,0 +1,705 @@
+import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { TransactionType, TransactionStatus, TransactionSource, AccountType, TransferKind, Frequency } from '@prisma/client';
+import { addMonths, startOfMonth } from 'date-fns';
+import { prisma } from '../lib/prisma.js';
+
+export async function transactionRoutes(app: FastifyInstance) {
+  app.addHook('preHandler', app.authenticate);
+
+  // Listar lançamentos com filtros
+  app.get('/', async (request) => {
+    const { workspaceId } = request.user;
+
+    const querySchema = z.object({
+      accountId: z.string().uuid().optional(),
+      categoryId: z.string().uuid().optional(),
+      status: z.nativeEnum(TransactionStatus).optional(),
+      type: z.nativeEnum(TransactionType).optional(),
+      startDate: z.string().optional(),
+      endDate: z.string().optional(),
+      page: z.coerce.number().default(1),
+      limit: z.coerce.number().default(50),
+    });
+
+    const query = querySchema.parse(request.query);
+
+    const where: any = {
+      workspaceId,
+      ...(query.accountId && { accountId: query.accountId }),
+      ...(query.categoryId && { categoryId: query.categoryId }),
+      ...(query.status && { status: query.status }),
+      ...(query.type && { type: query.type }),
+      ...(query.startDate || query.endDate
+        ? {
+            date: {
+              ...(query.startDate && { gte: new Date(query.startDate) }),
+              ...(query.endDate && { lte: new Date(query.endDate) }),
+            },
+          }
+        : {}),
+    };
+
+    const [total, transactions] = await Promise.all([
+      prisma.transaction.count({ where }),
+      prisma.transaction.findMany({
+        where,
+        include: {
+          account: { select: { id: true, name: true, type: true, color: true } },
+          category: { select: { id: true, name: true, type: true, color: true } },
+          payee: { select: { id: true, name: true } },
+          splits: { include: { category: true } },
+          tags: true,
+        },
+        orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
+      }),
+    ]);
+
+    return {
+      data: transactions,
+      pagination: {
+        page: query.page,
+        limit: query.limit,
+        total,
+        totalPages: Math.ceil(total / query.limit),
+      },
+    };
+  });
+
+  // Criar lançamento (avulso ou parcelado)
+  app.post('/', async (request, reply) => {
+    const { workspaceId, sub: userId } = request.user;
+
+    const createTransactionSchema = z.object({
+      accountId: z.string().uuid(),
+      type: z.nativeEnum(TransactionType),
+      amount: z.number(), // valor absoluto passado pelo cliente
+      date: z.string(), // ISO string YYYY-MM-DD
+      description: z.string().min(1),
+      categoryId: z.string().uuid().optional(),
+      payeeName: z.string().optional(),
+      status: z.nativeEnum(TransactionStatus).default(TransactionStatus.CLEARED),
+      notes: z.string().optional(),
+      // Parcelamento opcional
+      installments: z.number().int().min(1).max(120).default(1),
+      // Lançamento fixo / recorrente
+      isRecurring: z.boolean().default(false),
+      recurringMonths: z.number().int().min(1).max(120).default(12),
+    });
+
+    const data = createTransactionSchema.parse(request.body);
+
+    const account = await prisma.account.findFirst({
+      where: { id: data.accountId, workspaceId },
+    });
+
+    if (!account) {
+      return reply.status(400).send({ error: 'Conta não encontrada' });
+    }
+
+    // Gerenciar Payee se fornecido
+    let payeeId: string | undefined = undefined;
+    if (data.payeeName) {
+      const payee = await prisma.payee.upsert({
+        where: {
+          workspaceId_name: {
+            workspaceId,
+            name: data.payeeName,
+          },
+        },
+        update: {},
+        create: {
+          workspaceId,
+          name: data.payeeName,
+          defaultCategoryId: data.categoryId,
+        },
+      });
+      payeeId = payee.id;
+    }
+
+    const transactionDate = new Date(data.date);
+
+    // REGRA DE SINAL:
+    // Se for EXPENSE, amount DEVE ser negativo
+    // Se for INCOME, amount DEVE ser positivo
+    const signedAmount =
+      data.type === TransactionType.EXPENSE
+        ? -Math.abs(data.amount)
+        : Math.abs(data.amount);
+
+    // 1. Lançamento Fixo / Recorrente (Opção A: gera regra e projeções futuras como PENDING)
+    if (data.isRecurring) {
+      const months = data.recurringMonths || 12;
+      const dayOfMonth = transactionDate.getUTCDate();
+
+      const rule = await prisma.$transaction(async (tx) => {
+        const recurringRule = await tx.recurringRule.create({
+          data: {
+            workspaceId,
+            accountId: account.id,
+            categoryId: data.categoryId,
+            payeeId,
+            type: data.type,
+            description: data.description,
+            amount: signedAmount,
+            frequency: Frequency.MONTHLY,
+            interval: 1,
+            dayOfMonth,
+            startDate: transactionDate,
+            endDate: addMonths(transactionDate, months - 1),
+            nextOccurrence: addMonths(transactionDate, 1),
+            occurrencesLimit: months,
+            occurrencesCount: 1,
+            isActive: true,
+          },
+        });
+
+        // Gerar as N ocorrências (o 1º lançamento com o status informado, os demais como PENDING)
+        for (let i = 0; i < months; i++) {
+          const occDate = addMonths(transactionDate, i);
+
+          // Se for cartão, associar à fatura do mês correspondente
+          let invoiceId: string | undefined = undefined;
+          if (account.type === AccountType.CREDIT_CARD) {
+            const refMonth = startOfMonth(occDate);
+            let invoice = await tx.creditCardInvoice.findUnique({
+              where: {
+                accountId_referenceMonth: {
+                  accountId: account.id,
+                  referenceMonth: refMonth,
+                },
+              },
+            });
+
+            if (!invoice) {
+              const closingDay = account.closingDay || 1;
+              const dueDay = account.dueDay || 10;
+              const closingDate = new Date(occDate.getFullYear(), occDate.getMonth(), closingDay);
+              const dueDate = new Date(occDate.getFullYear(), occDate.getMonth(), dueDay);
+
+              invoice = await tx.creditCardInvoice.create({
+                data: {
+                  workspaceId,
+                  accountId: account.id,
+                  referenceMonth: refMonth,
+                  closingDate,
+                  dueDate,
+                  status: i === 0 ? 'OPEN' : 'FUTURE',
+                },
+              });
+            }
+            invoiceId = invoice.id;
+          }
+
+          await tx.transaction.create({
+            data: {
+              workspaceId,
+              accountId: account.id,
+              type: data.type,
+              status: i === 0 ? data.status : TransactionStatus.PENDING,
+              source: TransactionSource.RECURRING,
+              amount: signedAmount,
+              date: occDate,
+              description: data.description,
+              categoryId: data.categoryId,
+              payeeId,
+              invoiceId,
+              recurringRuleId: recurringRule.id,
+              createdById: userId,
+              notes: data.notes,
+            },
+          });
+        }
+
+        return recurringRule;
+      });
+
+      return reply.status(201).send({
+        message: 'Lançamento fixo e previsões geradas com sucesso',
+        recurringRule: rule,
+      });
+    }
+
+    // 2. Compra parcelada (com cartão ou carnê)
+    if (data.installments > 1) {
+      const totalAmount = Math.abs(data.amount);
+      const installmentAmount = Number((totalAmount / data.installments).toFixed(2));
+      const firstInstallmentAmount = Number(
+        (totalAmount - installmentAmount * (data.installments - 1)).toFixed(2)
+      );
+
+      const plan = await prisma.$transaction(async (tx) => {
+        const installmentPlan = await tx.installmentPlan.create({
+          data: {
+            workspaceId,
+            accountId: account.id,
+            categoryId: data.categoryId,
+            payeeId,
+            description: data.description,
+            purchaseDate: transactionDate,
+            firstDueMonth: startOfMonth(transactionDate),
+            installmentCount: data.installments,
+            installmentAmount,
+            firstInstallmentAmount,
+            totalAmount,
+            remainingAmount: totalAmount,
+            lastDueMonth: startOfMonth(addMonths(transactionDate, data.installments - 1)),
+          },
+        });
+
+        // Gerar os N lançamentos
+        for (let i = 1; i <= data.installments; i++) {
+          const installmentDate = addMonths(transactionDate, i - 1);
+          const currentAmount = i === 1 ? firstInstallmentAmount : installmentAmount;
+          const installmentSignedAmount = data.type === TransactionType.EXPENSE ? -currentAmount : currentAmount;
+          
+          // Se for cartão, associar à fatura do mês correspondente
+          let invoiceId: string | undefined = undefined;
+          if (account.type === AccountType.CREDIT_CARD) {
+            const refMonth = startOfMonth(installmentDate);
+            let invoice = await tx.creditCardInvoice.findUnique({
+              where: {
+                accountId_referenceMonth: {
+                  accountId: account.id,
+                  referenceMonth: refMonth,
+                },
+              },
+            });
+
+            if (!invoice) {
+              const closingDay = account.closingDay || 1;
+              const dueDay = account.dueDay || 10;
+              const closingDate = new Date(installmentDate.getFullYear(), installmentDate.getMonth(), closingDay);
+              const dueDate = new Date(installmentDate.getFullYear(), installmentDate.getMonth(), dueDay);
+
+              invoice = await tx.creditCardInvoice.create({
+                data: {
+                  workspaceId,
+                  accountId: account.id,
+                  referenceMonth: refMonth,
+                  closingDate,
+                  dueDate,
+                  status: i === 1 ? 'OPEN' : 'FUTURE',
+                },
+              });
+            }
+            invoiceId = invoice.id;
+          }
+
+          await tx.transaction.create({
+            data: {
+              workspaceId,
+              accountId: account.id,
+              type: data.type,
+              status: i === 1 ? data.status : TransactionStatus.PENDING,
+              source: TransactionSource.INSTALLMENT,
+              amount: installmentSignedAmount,
+              date: installmentDate,
+              description: `${data.description} (${i}/${data.installments})`,
+              categoryId: data.categoryId,
+              payeeId,
+              invoiceId,
+              installmentPlanId: installmentPlan.id,
+              installmentNumber: i,
+              createdById: userId,
+              notes: data.notes,
+            },
+          });
+        }
+
+        return installmentPlan;
+      });
+
+      return reply.status(201).send({
+        message: 'Compra parcelada registrada com sucesso',
+        installmentPlan: plan,
+      });
+    }
+
+    // 2. Lançamento simples (avulso)
+    let invoiceId: string | undefined = undefined;
+    if (account.type === AccountType.CREDIT_CARD) {
+      const refMonth = startOfMonth(transactionDate);
+      let invoice = await prisma.creditCardInvoice.findUnique({
+        where: {
+          accountId_referenceMonth: {
+            accountId: account.id,
+            referenceMonth: refMonth,
+          },
+        },
+      });
+
+      if (!invoice) {
+        const closingDay = account.closingDay || 1;
+        const dueDay = account.dueDay || 10;
+        const closingDate = new Date(transactionDate.getFullYear(), transactionDate.getMonth(), closingDay);
+        const dueDate = new Date(transactionDate.getFullYear(), transactionDate.getMonth(), dueDay);
+
+        invoice = await prisma.creditCardInvoice.create({
+          data: {
+            workspaceId,
+            accountId: account.id,
+            referenceMonth: refMonth,
+            closingDate,
+            dueDate,
+            status: 'OPEN',
+          },
+        });
+      }
+      invoiceId = invoice.id;
+    }
+
+    const transaction = await prisma.transaction.create({
+      data: {
+        workspaceId,
+        accountId: account.id,
+        type: data.type,
+        status: data.status,
+        amount: signedAmount,
+        date: transactionDate,
+        description: data.description,
+        categoryId: data.categoryId,
+        payeeId,
+        invoiceId,
+        notes: data.notes,
+        createdById: userId,
+      },
+      include: {
+        account: true,
+        category: true,
+      },
+    });
+
+    return reply.status(201).send(transaction);
+  });
+
+  // Atualizar lançamento
+  app.put('/:id', async (request, reply) => {
+    const { workspaceId, sub: userId } = request.user;
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+
+    const updateTransactionSchema = z.object({
+      description: z.string().optional(),
+      amount: z.number().optional(),
+      type: z.nativeEnum(TransactionType).optional(),
+      status: z.nativeEnum(TransactionStatus).optional(),
+      categoryId: z.string().uuid().nullable().optional(),
+      notes: z.string().optional(),
+      date: z.string().optional(),
+      toAccountId: z.string().uuid().optional(), // Para converter em transferência entre contas
+      isRecurring: z.boolean().optional(),
+      recurringMonths: z.number().int().min(1).max(120).optional(),
+      installments: z.number().int().min(1).max(120).optional(),
+    });
+
+    const data = updateTransactionSchema.parse(request.body);
+
+    const existing = await prisma.transaction.findFirst({
+      where: { id, workspaceId },
+    });
+
+    if (!existing) {
+      return reply.status(404).send({ error: 'Lançamento não encontrado' });
+    }
+
+    if (existing.status === TransactionStatus.RECONCILED && data.status !== TransactionStatus.CLEARED) {
+      return reply.status(400).send({
+        error: 'Lançamento já conciliado. Altere para CLEARED antes de editar valor ou data.',
+      });
+    }
+
+    let updatedAmount = undefined;
+    if (data.amount !== undefined) {
+      if (data.type === TransactionType.EXPENSE) {
+        updatedAmount = -Math.abs(data.amount);
+      } else if (data.type === TransactionType.INCOME) {
+        updatedAmount = Math.abs(data.amount);
+      } else if (data.type === TransactionType.TRANSFER) {
+        // Se for transferência, mantém o sinal do lançamento original
+        // Se era débito (-), permanece débito (-)
+        const wasNegative = Number(existing.amount) < 0;
+        updatedAmount = wasNegative ? -Math.abs(data.amount) : Math.abs(data.amount);
+      } else {
+        const wasNegative = Number(existing.amount) < 0;
+        updatedAmount = wasNegative ? -Math.abs(data.amount) : Math.abs(data.amount);
+      }
+    }
+
+    const finalAmount = updatedAmount !== undefined ? updatedAmount : Number(existing.amount);
+    const finalDate = data.date ? new Date(data.date) : existing.date;
+    const finalStatus = data.status || existing.status;
+
+    let updatedResult;
+
+    // Se solicitado conversão em transferência entre contas, executa tudo em transação atômica
+    if (data.type === TransactionType.TRANSFER && data.toAccountId) {
+      const destinationAccount = await prisma.account.findFirst({
+        where: { id: data.toAccountId, workspaceId },
+      });
+
+      if (!destinationAccount) {
+        return reply.status(404).send({ error: 'Conta de destino não encontrada' });
+      }
+
+      updatedResult = await prisma.$transaction(async (tx) => {
+        const updated = await tx.transaction.update({
+          where: { id },
+          data: {
+            ...(data.description && { description: data.description }),
+            ...(data.notes !== undefined && { notes: data.notes }),
+            status: finalStatus,
+            type: TransactionType.TRANSFER,
+            categoryId: null, // transferência não possui categoria de despesa
+            date: finalDate,
+            amount: finalAmount,
+            updatedById: userId,
+          },
+        });
+
+        const existingTransfer = await tx.transfer.findFirst({
+          where: {
+            OR: [{ fromTransactionId: existing.id }, { toTransactionId: existing.id }],
+          },
+        });
+
+        if (!existingTransfer) {
+          const transferAmount = Math.abs(finalAmount);
+          const isDebit = finalAmount < 0;
+
+          if (isDebit) {
+            // Lançamento atual é a saída (-) no Itaú. Cria a entrada (+) no destino:
+            const toTx = await tx.transaction.create({
+              data: {
+                workspaceId,
+                accountId: destinationAccount.id,
+                type: TransactionType.TRANSFER,
+                status: finalStatus,
+                amount: transferAmount,
+                date: finalDate,
+                description: data.description || `Transferência recebida de ${destinationAccount.name}`,
+                createdById: userId,
+              },
+            });
+
+            await tx.transfer.create({
+              data: {
+                workspaceId,
+                kind: TransferKind.TRANSFER,
+                fromTransactionId: existing.id,
+                toTransactionId: toTx.id,
+                amount: transferAmount,
+                date: finalDate,
+                description: data.description || existing.description,
+              },
+            });
+          } else {
+            // Lançamento atual é a entrada (+) no Itaú. Cria a saída (-) no destino:
+            const fromTx = await tx.transaction.create({
+              data: {
+                workspaceId,
+                accountId: destinationAccount.id,
+                type: TransactionType.TRANSFER,
+                status: finalStatus,
+                amount: -transferAmount,
+                date: finalDate,
+                description: data.description || `Transferência enviada para ${destinationAccount.name}`,
+                createdById: userId,
+              },
+            });
+
+            await tx.transfer.create({
+              data: {
+                workspaceId,
+                kind: TransferKind.TRANSFER,
+                fromTransactionId: fromTx.id,
+                toTransactionId: existing.id,
+                amount: transferAmount,
+                date: finalDate,
+                description: data.description || existing.description,
+              },
+            });
+          }
+        }
+
+        return updated;
+      });
+    } else if (data.isRecurring && !existing.recurringRuleId) {
+      const months = data.recurringMonths || 12;
+      const dayOfMonth = finalDate.getUTCDate();
+
+      updatedResult = await prisma.$transaction(async (tx) => {
+        const recurringRule = await tx.recurringRule.create({
+          data: {
+            workspaceId,
+            accountId: existing.accountId,
+            categoryId: data.categoryId !== undefined ? data.categoryId : existing.categoryId,
+            payeeId: existing.payeeId,
+            type: data.type || existing.type,
+            description: data.description || existing.description,
+            amount: finalAmount,
+            frequency: Frequency.MONTHLY,
+            interval: 1,
+            dayOfMonth,
+            startDate: finalDate,
+            endDate: addMonths(finalDate, months - 1),
+            nextOccurrence: addMonths(finalDate, 1),
+            occurrencesLimit: months,
+            occurrencesCount: 1,
+            isActive: true,
+          },
+        });
+
+        const updated = await tx.transaction.update({
+          where: { id },
+          data: {
+            ...(data.description && { description: data.description }),
+            ...(data.categoryId !== undefined && { categoryId: data.categoryId }),
+            ...(data.notes !== undefined && { notes: data.notes }),
+            status: finalStatus,
+            type: data.type || existing.type,
+            date: finalDate,
+            amount: finalAmount,
+            source: TransactionSource.RECURRING,
+            recurringRuleId: recurringRule.id,
+            updatedById: userId,
+          },
+        });
+
+        // Gerar meses futuros (i = 1 até months - 1) como PENDING
+        for (let i = 1; i < months; i++) {
+          const occDate = addMonths(finalDate, i);
+          await tx.transaction.create({
+            data: {
+              workspaceId,
+              accountId: existing.accountId,
+              type: data.type || existing.type,
+              status: TransactionStatus.PENDING,
+              source: TransactionSource.RECURRING,
+              amount: finalAmount,
+              date: occDate,
+              description: data.description || existing.description,
+              categoryId: data.categoryId !== undefined ? data.categoryId : existing.categoryId,
+              payeeId: existing.payeeId,
+              recurringRuleId: recurringRule.id,
+              createdById: userId,
+              notes: data.notes || existing.notes,
+            },
+          });
+        }
+
+        return updated;
+      });
+    } else if (data.installments && data.installments > 1 && !existing.installmentPlanId) {
+      const totalAmount = Math.abs(finalAmount);
+      const installmentCount = data.installments;
+      const installmentAmount = Number((totalAmount / installmentCount).toFixed(2));
+      const firstInstallmentAmount = Number(
+        (totalAmount - installmentAmount * (installmentCount - 1)).toFixed(2)
+      );
+      const isExpense = (data.type || existing.type) === TransactionType.EXPENSE;
+      const firstSigned = isExpense ? -firstInstallmentAmount : firstInstallmentAmount;
+      const otherSigned = isExpense ? -installmentAmount : installmentAmount;
+
+      updatedResult = await prisma.$transaction(async (tx) => {
+        const plan = await tx.installmentPlan.create({
+          data: {
+            workspaceId,
+            accountId: existing.accountId,
+            categoryId: data.categoryId !== undefined ? data.categoryId : existing.categoryId,
+            payeeId: existing.payeeId,
+            description: data.description || existing.description,
+            purchaseDate: finalDate,
+            firstDueMonth: startOfMonth(finalDate),
+            installmentCount,
+            installmentAmount,
+            firstInstallmentAmount,
+            totalAmount,
+            remainingAmount: totalAmount,
+            lastDueMonth: startOfMonth(addMonths(finalDate, installmentCount - 1)),
+          },
+        });
+
+        const updated = await tx.transaction.update({
+          where: { id },
+          data: {
+            description: `${data.description || existing.description} (1/${installmentCount})`,
+            ...(data.categoryId !== undefined && { categoryId: data.categoryId }),
+            ...(data.notes !== undefined && { notes: data.notes }),
+            status: finalStatus,
+            type: data.type || existing.type,
+            date: finalDate,
+            amount: firstSigned,
+            source: TransactionSource.INSTALLMENT,
+            installmentPlanId: plan.id,
+            installmentNumber: 1,
+            updatedById: userId,
+          },
+        });
+
+        for (let i = 2; i <= installmentCount; i++) {
+          const installmentDate = addMonths(finalDate, i - 1);
+          await tx.transaction.create({
+            data: {
+              workspaceId,
+              accountId: existing.accountId,
+              type: data.type || existing.type,
+              status: TransactionStatus.PENDING,
+              source: TransactionSource.INSTALLMENT,
+              amount: otherSigned,
+              date: installmentDate,
+              description: `${data.description || existing.description} (${i}/${installmentCount})`,
+              categoryId: data.categoryId !== undefined ? data.categoryId : existing.categoryId,
+              payeeId: existing.payeeId,
+              installmentPlanId: plan.id,
+              installmentNumber: i,
+              createdById: userId,
+              notes: data.notes || existing.notes,
+            },
+          });
+        }
+
+        return updated;
+      });
+    } else {
+      updatedResult = await prisma.transaction.update({
+        where: { id },
+        data: {
+          ...(data.description && { description: data.description }),
+          ...(data.categoryId !== undefined && { categoryId: data.categoryId }),
+          ...(data.notes !== undefined && { notes: data.notes }),
+          ...(data.status && { status: data.status }),
+          ...(data.type && { type: data.type }),
+          ...(data.date && { date: new Date(data.date) }),
+          ...(updatedAmount !== undefined && { amount: updatedAmount }),
+          updatedById: userId,
+        },
+      });
+    }
+
+    return updatedResult;
+  });
+
+  // Excluir lançamento
+  app.delete('/:id', async (request, reply) => {
+    const { workspaceId } = request.user;
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+
+    const existing = await prisma.transaction.findFirst({
+      where: { id, workspaceId },
+    });
+
+    if (!existing) {
+      return reply.status(404).send({ error: 'Lançamento não encontrado' });
+    }
+
+    if (existing.status === TransactionStatus.RECONCILED) {
+      return reply.status(400).send({ error: 'Lançamento conciliado não pode ser excluído.' });
+    }
+
+    await prisma.transaction.delete({ where: { id } });
+
+    return reply.status(204).send();
+  });
+}
