@@ -11,7 +11,8 @@
     "import:ofx": "npm --prefix backend run import:ofx",
     "reset:tx": "npm --prefix backend run db:reset-tx",
     "set:balance": "npm --prefix backend run set:balance",
-    "recalculate": "npm --prefix backend run recalculate"
+    "recalculate": "npm --prefix backend run recalculate",
+    "migrate:competence": "npm --prefix backend run migrate:competence"
   },
   "keywords": ["finance", "fastify", "nextjs", "prisma", "postgresql"],
   "author": "Carlos Brazil",

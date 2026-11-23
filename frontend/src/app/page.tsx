@@ -216,8 +216,12 @@ export default function DashboardPage() {
     const token = localStorage.getItem("token");
     if (!token) return;
 
-    const currentTxDate = tx.date ? new Date(tx.date).toISOString().split("T")[0] : new Date().toISOString().split("T")[0];
-    const newDate = computeShiftedDate(currentTxDate, delta);
+    // Se tiver competenceDate, usa competenceDate como referência; senão, usa a data da compra
+    const currentRefDate = tx.competenceDate
+      ? (typeof tx.competenceDate === "string" ? tx.competenceDate.split("T")[0] : new Date(tx.competenceDate).toISOString().split("T")[0])
+      : (tx.date ? (typeof tx.date === "string" ? tx.date.split("T")[0] : new Date(tx.date).toISOString().split("T")[0]) : new Date().toISOString().split("T")[0]);
+
+    const targetMonthStr = computeShiftedDate(currentRefDate, delta);
 
     try {
       const res = await fetch(`${API_BASE}/transactions/${tx.id}`, {
@@ -232,7 +236,7 @@ export default function DashboardPage() {
           type: tx.type,
           categoryId: tx.categoryId || undefined,
           status: tx.status,
-          date: newDate,
+          competenceDate: `${targetMonthStr}T12:00:00Z`,
         }),
       });
 
@@ -272,14 +276,17 @@ export default function DashboardPage() {
   }
 
   // Filtro resiliente para garantir exibição estrita do mês selecionado
-  const isTxInSelectedMonth = (txDate: string | Date) => {
-    if (!txDate) return false;
-    const dStr = typeof txDate === "string" ? txDate.split("T")[0] : new Date(txDate).toISOString().split("T")[0];
+  // Se a transação possui competenceDate (ex: alocada a uma fatura específica), usamos competenceDate; senão, usamos date
+  const isTxInSelectedMonth = (tx: any) => {
+    if (!tx) return false;
+    const refDate = tx.competenceDate || tx.date;
+    if (!refDate) return false;
+    const dStr = typeof refDate === "string" ? refDate.split("T")[0] : new Date(refDate).toISOString().split("T")[0];
     const [y, m] = dStr.split("-").map(Number);
     return y === currentDate.getFullYear() && m === currentDate.getMonth() + 1;
   };
 
-  const monthlyTransactions = transactions.filter((t) => isTxInSelectedMonth(t.date));
+  const monthlyTransactions = transactions.filter(isTxInSelectedMonth);
 
   // Contagens para os botões de filtro rápido
   const bankAccountTxCount = useMemo(
@@ -892,6 +899,23 @@ export default function DashboardPage() {
                             </div>
                             <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5 flex-wrap">
                               <span>{formatDate(tx.date)}</span>
+                              {tx.competenceDate && (() => {
+                                const d1 = (typeof tx.date === "string" ? tx.date : new Date(tx.date).toISOString()).split("T")[0];
+                                const d2 = (typeof tx.competenceDate === "string" ? tx.competenceDate : new Date(tx.competenceDate).toISOString()).split("T")[0];
+                                const [y1, m1] = d1.split("-");
+                                const [y2, m2] = d2.split("-");
+                                if (y1 !== y2 || m1 !== m2) {
+                                  return (
+                                    <span
+                                      title={`Compra em ${formatDate(tx.date)} atribuída à fatura de ${m2}/${y2}`}
+                                      className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[10px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/25"
+                                    >
+                                      <Calendar className="h-2.5 w-2.5" /> Fatura {m2}/{y2}
+                                    </span>
+                                  );
+                                }
+                                return null;
+                              })()}
                               <span>•</span>
                               <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-medium">
                                 {tx.category?.name || "Sem categoria"}

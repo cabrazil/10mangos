@@ -30,6 +30,7 @@ export function EditTransactionModal({
   const [categoryId, setCategoryId] = useState("");
   const [status, setStatus] = useState<"CLEARED" | "PENDING">("CLEARED");
   const [date, setDate] = useState("");
+  const [competenceDate, setCompetenceDate] = useState("");
   const [repeatType, setRepeatType] = useState<"SINGLE" | "RECURRING" | "INSTALLMENTS">("SINGLE");
   const [recurringMonths, setRecurringMonths] = useState(12);
   const [installments, setInstallments] = useState(1);
@@ -52,6 +53,8 @@ export function EditTransactionModal({
       }
       const d = transaction.date ? new Date(transaction.date).toISOString().split("T")[0] : "";
       setDate(d);
+      const compD = transaction.competenceDate ? new Date(transaction.competenceDate).toISOString().split("T")[0] : "";
+      setCompetenceDate(compD);
 
       if (transaction.recurringRuleId || transaction.source === "RECURRING") {
         setRepeatType("RECURRING");
@@ -76,9 +79,11 @@ export function EditTransactionModal({
   }
 
   function handleShiftMonth(delta: -1 | 1) {
-    if (!date) return;
-    const newDate = computeShiftedDate(date, delta);
-    setDate(newDate);
+    // Altera a fatura de competência, preservando a data histórica da compra!
+    const baseDate = competenceDate || date;
+    if (!baseDate) return;
+    const newCompDate = computeShiftedDate(baseDate, delta);
+    setCompetenceDate(newCompDate);
   }
 
   if (!isOpen || !transaction) return null;
@@ -121,7 +126,8 @@ export function EditTransactionModal({
           toAccountId: type === "TRANSFER" ? toAccountId : undefined,
           categoryId: type !== "TRANSFER" ? (categoryId || null) : null,
           status,
-          date,
+          date: date ? `${date.split("T")[0]}T12:00:00Z` : undefined,
+          competenceDate: competenceDate ? `${competenceDate.split("T")[0]}T12:00:00Z` : undefined,
           isRecurring,
           recurringMonths: isRecurring ? Number(recurringMonths) : undefined,
           installments: finalInstallments > 1 ? finalInstallments : undefined,
@@ -387,6 +393,12 @@ export function EditTransactionModal({
                   className="w-full bg-transparent text-sm text-slate-100 focus:outline-none cursor-pointer"
                 />
               </div>
+              {competenceDate && competenceDate.split("-")[1] !== (date ? date.split("-")[1] : "") && (
+                <div className="flex items-center justify-between text-[11px] text-amber-300/90 pt-0.5">
+                  <span>Fatura de Referência:</span>
+                  <span className="font-bold">Mês {competenceDate.split("-")[1]}/{competenceDate.split("-")[0]}</span>
+                </div>
+              )}
             </div>
 
             <div className="space-y-1.5">

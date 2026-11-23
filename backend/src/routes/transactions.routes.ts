@@ -4,6 +4,17 @@ import { TransactionType, TransactionStatus, TransactionSource, AccountType, Tra
 import { addMonths, startOfMonth } from 'date-fns';
 import { prisma } from '../lib/prisma.js';
 
+function parseDateSafely(dateInput: string | Date | undefined): Date | undefined {
+  if (!dateInput) return undefined;
+  if (dateInput instanceof Date) return dateInput;
+  const clean = dateInput.split('T')[0];
+  const [y, m, d] = clean.split('-').map(Number);
+  if (!isNaN(y) && !isNaN(m) && !isNaN(d)) {
+    return new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+  }
+  return new Date(dateInput);
+}
+
 export async function transactionRoutes(app: FastifyInstance) {
   app.addHook('preHandler', app.authenticate);
 
@@ -30,15 +41,28 @@ export async function transactionRoutes(app: FastifyInstance) {
       ...(query.categoryId && { categoryId: query.categoryId }),
       ...(query.status && { status: query.status }),
       ...(query.type && { type: query.type }),
-      ...(query.startDate || query.endDate
-        ? {
-            date: {
-              ...(query.startDate && { gte: new Date(query.startDate) }),
-              ...(query.endDate && { lte: new Date(query.endDate) }),
-            },
-          }
-        : {}),
     };
+
+    if (query.startDate || query.endDate) {
+      const startGte = query.startDate ? new Date(`${query.startDate.split('T')[0]}T00:00:00.000Z`) : undefined;
+      const endLte = query.endDate ? new Date(`${query.endDate.split('T')[0]}T23:59:59.999Z`) : undefined;
+
+      where.OR = [
+        {
+          competenceDate: {
+            ...(startGte && { gte: startGte }),
+            ...(endLte && { lte: endLte }),
+          },
+        },
+        {
+          competenceDate: null,
+          date: {
+            ...(startGte && { gte: startGte }),
+            ...(endLte && { lte: endLte }),
+          },
+        },
+      ];
+    }
 
     const [total, transactions] = await Promise.all([
       prisma.transaction.count({ where }),
@@ -82,6 +106,7 @@ export async function transactionRoutes(app: FastifyInstance) {
       payeeName: z.string().optional(),
       status: z.nativeEnum(TransactionStatus).default(TransactionStatus.CLEARED),
       notes: z.string().optional(),
+      competenceDate: z.string().nullable().optional(),
       // Parcelamento opcional
       installments: z.number().int().min(1).max(120).default(1),
       // Lançamento fixo / recorrente
@@ -119,7 +144,7 @@ export async function transactionRoutes(app: FastifyInstance) {
       payeeId = payee.id;
     }
 
-    const transactionDate = new Date(data.date);
+    const transactionDate = parseDateSafely(data.date) || new Date();
 
     // REGRA DE SINAL:
     // Se for EXPENSE, amount DEVE ser negativo
@@ -363,6 +388,7 @@ export async function transactionRoutes(app: FastifyInstance) {
         categoryId: data.categoryId,
         payeeId,
         invoiceId,
+        competenceDate: parseDateSafely(data.competenceDate),
         notes: data.notes,
         createdById: userId,
       },
@@ -388,6 +414,7 @@ export async function transactionRoutes(app: FastifyInstance) {
       categoryId: z.string().uuid().nullable().optional(),
       notes: z.string().optional(),
       date: z.string().optional(),
+      competenceDate: z.string().nullable().optional(),
       toAccountId: z.string().uuid().optional(), // Para converter em transferência entre contas
       isRecurring: z.boolean().optional(),
       recurringMonths: z.number().int().min(1).max(120).optional(),
@@ -428,7 +455,7 @@ export async function transactionRoutes(app: FastifyInstance) {
     }
 
     const finalAmount = updatedAmount !== undefined ? updatedAmount : Number(existing.amount);
-    const finalDate = data.date ? new Date(data.date) : existing.date;
+    const finalDate = data.date ? (parseDateSafely(data.date) || existing.date) : existing.date;
     const finalStatus = data.status || existing.status;
 
     let updatedResult;
@@ -671,7 +698,8 @@ export async function transactionRoutes(app: FastifyInstance) {
           ...(data.notes !== undefined && { notes: data.notes }),
           ...(data.status && { status: data.status }),
           ...(data.type && { type: data.type }),
-          ...(data.date && { date: new Date(data.date) }),
+          ...(data.date && { date: parseDateSafely(data.date) }),
+          ...(data.competenceDate !== undefined && { competenceDate: parseDateSafely(data.competenceDate) }),
           ...(updatedAmount !== undefined && { amount: updatedAmount }),
           updatedById: userId,
         },

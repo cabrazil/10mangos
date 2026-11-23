@@ -17,7 +17,8 @@
     "check:itau": "tsx src/scripts/check-itau.ts",
     "db:reset-tx": "tsx src/scripts/reset-transactions.ts",
     "set:balance": "tsx src/scripts/set-initial-balance.ts",
-    "recalculate": "tsx src/scripts/recalculate-balances.ts"
+    "recalculate": "tsx src/scripts/recalculate-balances.ts",
+    "migrate:competence": "tsx src/scripts/set-card-competence.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

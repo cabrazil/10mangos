@@ -438,6 +438,21 @@ export async function importRoutes(app: FastifyInstance) {
           continue;
         }
 
+        let competenceDate: Date | undefined = undefined;
+        if (account.type === AccountType.CREDIT_CARD) {
+          const closingDay = account.closingDay || 30;
+          const trnDay = trn.date.getUTCDate();
+          // Se a compra foi feita nos dias de fechamento (ex: dia 28 a 31),
+          // ela cai na fatura do mês seguinte
+          if (trnDay >= Math.min(closingDay, 28)) {
+            const d = new Date(trn.date);
+            d.setUTCMonth(d.getUTCMonth() + 1);
+            d.setUTCDate(1);
+            d.setUTCHours(12, 0, 0, 0);
+            competenceDate = d;
+          }
+        }
+
         await prisma.transaction.create({
           data: {
             workspaceId,
@@ -447,6 +462,7 @@ export async function importRoutes(app: FastifyInstance) {
             source: TransactionSource.OFX_IMPORT,
             amount,
             date: trn.date,
+            competenceDate,
             description: trn.memo,
             originalDescription: trn.memo,
             fitId: trn.fitId,
