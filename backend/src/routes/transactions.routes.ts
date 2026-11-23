@@ -15,6 +15,19 @@ function parseDateSafely(dateInput: string | Date | null | undefined): Date | un
   return new Date(dateInput);
 }
 
+export function computeCardCompetenceDate(purchaseDate: Date, closingDay?: number | null): Date {
+  const day = purchaseDate.getUTCDate();
+  const year = purchaseDate.getUTCFullYear();
+  const month = purchaseDate.getUTCMonth(); // 0-indexed
+
+  // Se o dia da compra for maior ou igual ao dia de corte (fechamento):
+  // compras a partir do corte entram na fatura do mês seguinte!
+  const cutOff = closingDay && closingDay > 1 ? closingDay : 20;
+  const isAfterClosing = day >= cutOff;
+
+  return new Date(Date.UTC(year, isAfterClosing ? month + 1 : month, 1, 12, 0, 0));
+}
+
 export async function transactionRoutes(app: FastifyInstance) {
   app.addHook('preHandler', app.authenticate);
 
@@ -288,10 +301,12 @@ export async function transactionRoutes(app: FastifyInstance) {
           const currentAmount = i === 1 ? firstInstallmentAmount : installmentAmount;
           const installmentSignedAmount = data.type === TransactionType.EXPENSE ? -currentAmount : currentAmount;
           
-          // Se for cartão, associar à fatura do mês correspondente
+          let competenceDate: Date | null = null;
           let invoiceId: string | undefined = undefined;
+
           if (account.type === AccountType.CREDIT_CARD) {
-            const refMonth = startOfMonth(installmentDate);
+            competenceDate = computeCardCompetenceDate(installmentDate, account.closingDay);
+            const refMonth = startOfMonth(competenceDate);
             let invoice = await tx.creditCardInvoice.findUnique({
               where: {
                 accountId_referenceMonth: {
@@ -304,8 +319,8 @@ export async function transactionRoutes(app: FastifyInstance) {
             if (!invoice) {
               const closingDay = account.closingDay || 1;
               const dueDay = account.dueDay || 10;
-              const closingDate = new Date(installmentDate.getFullYear(), installmentDate.getMonth(), closingDay);
-              const dueDate = new Date(installmentDate.getFullYear(), installmentDate.getMonth(), dueDay);
+              const closingDate = new Date(competenceDate.getFullYear(), competenceDate.getMonth(), closingDay);
+              const dueDate = new Date(competenceDate.getFullYear(), competenceDate.getMonth(), dueDay);
 
               invoice = await tx.creditCardInvoice.create({
                 data: {
@@ -330,6 +345,7 @@ export async function transactionRoutes(app: FastifyInstance) {
               source: TransactionSource.INSTALLMENT,
               amount: installmentSignedAmount,
               date: installmentDate,
+              competenceDate,
               description: `${data.description} (${i}/${data.installments})`,
               categoryId: data.categoryId,
               payeeId,
@@ -353,8 +369,13 @@ export async function transactionRoutes(app: FastifyInstance) {
 
     // 2. Lançamento simples (avulso)
     let invoiceId: string | undefined = undefined;
+    let competenceDate: Date | null = data.competenceDate ? parseDateSafely(data.competenceDate) || null : null;
+
     if (account.type === AccountType.CREDIT_CARD) {
-      const refMonth = startOfMonth(transactionDate);
+      if (!competenceDate) {
+        competenceDate = computeCardCompetenceDate(transactionDate, account.closingDay);
+      }
+      const refMonth = startOfMonth(competenceDate);
       let invoice = await prisma.creditCardInvoice.findUnique({
         where: {
           accountId_referenceMonth: {
@@ -367,8 +388,8 @@ export async function transactionRoutes(app: FastifyInstance) {
       if (!invoice) {
         const closingDay = account.closingDay || 1;
         const dueDay = account.dueDay || 10;
-        const closingDate = new Date(transactionDate.getFullYear(), transactionDate.getMonth(), closingDay);
-        const dueDate = new Date(transactionDate.getFullYear(), transactionDate.getMonth(), dueDay);
+        const closingDate = new Date(competenceDate.getFullYear(), competenceDate.getMonth(), closingDay);
+        const dueDate = new Date(competenceDate.getFullYear(), competenceDate.getMonth(), dueDay);
 
         invoice = await prisma.creditCardInvoice.create({
           data: {
@@ -396,7 +417,7 @@ export async function transactionRoutes(app: FastifyInstance) {
         categoryId: data.categoryId,
         payeeId,
         invoiceId,
-        competenceDate: data.competenceDate ? parseDateSafely(data.competenceDate) : null,
+        competenceDate,
         notes: data.notes,
         createdById: userId,
       },
@@ -627,6 +648,10 @@ export async function transactionRoutes(app: FastifyInstance) {
         return updated;
       });
     } else if (data.installments && data.installments > 1 && !existing.installmentPlanId) {
+      const existingAccount = await prisma.account.findUnique({ where: { id: existing.accountId } });
+      const isCard = existingAccount?.type === AccountType.CREDIT_CARD;
+      const closingDay = existingAccount?.closingDay;
+
       const totalAmount = Math.abs(finalAmount);
       const installmentCount = data.installments;
       const installmentAmount = Number((totalAmount / installmentCount).toFixed(2));
@@ -637,6 +662,8 @@ export async function transactionRoutes(app: FastifyInstance) {
       const firstSigned = isExpense ? -firstInstallmentAmount : firstInstallmentAmount;
       const otherSigned = isExpense ? -installmentAmount : installmentAmount;
 
+      const firstCompDate = isCard ? computeCardCompetenceDate(finalDate, closingDay) : (data.competenceDate ? parseDateSafely(data.competenceDate) || null : null);
+
       updatedResult = await prisma.$transaction(async (tx) => {
         const plan = await tx.installmentPlan.create({
           data: {
@@ -646,13 +673,13 @@ export async function transactionRoutes(app: FastifyInstance) {
             payeeId: existing.payeeId,
             description: data.description || existing.description,
             purchaseDate: finalDate,
-            firstDueMonth: startOfMonth(finalDate),
+            firstDueMonth: startOfMonth(firstCompDate || finalDate),
             installmentCount,
             installmentAmount,
             firstInstallmentAmount,
             totalAmount,
             remainingAmount: totalAmount,
-            lastDueMonth: startOfMonth(addMonths(finalDate, installmentCount - 1)),
+            lastDueMonth: startOfMonth(addMonths(firstCompDate || finalDate, installmentCount - 1)),
           },
         });
 
@@ -665,6 +692,7 @@ export async function transactionRoutes(app: FastifyInstance) {
             status: finalStatus,
             type: data.type || existing.type,
             date: finalDate,
+            competenceDate: firstCompDate,
             amount: firstSigned,
             source: TransactionSource.INSTALLMENT,
             installmentPlanId: plan.id,
@@ -675,6 +703,8 @@ export async function transactionRoutes(app: FastifyInstance) {
 
         for (let i = 2; i <= installmentCount; i++) {
           const installmentDate = addMonths(finalDate, i - 1);
+          const installmentCompDate = isCard ? computeCardCompetenceDate(installmentDate, closingDay) : null;
+
           await tx.transaction.create({
             data: {
               workspaceId,
@@ -684,6 +714,7 @@ export async function transactionRoutes(app: FastifyInstance) {
               source: TransactionSource.INSTALLMENT,
               amount: otherSigned,
               date: installmentDate,
+              competenceDate: installmentCompDate,
               description: `${data.description || existing.description} (${i}/${installmentCount})`,
               categoryId: data.categoryId !== undefined ? data.categoryId : existing.categoryId,
               payeeId: existing.payeeId,
