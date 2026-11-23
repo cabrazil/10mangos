@@ -571,7 +571,6 @@ export async function importRoutes(app: FastifyInstance) {
               importHash,
               categoryId,
               installmentNumber: trn.installmentNumber,
-              installmentCount: trn.installmentCount,
               createdById: userId,
             },
           });
@@ -585,7 +584,8 @@ export async function importRoutes(app: FastifyInstance) {
           skipped,
         });
       }
-    } catch (nuErr) {
+    } catch (nuErr: any) {
+      console.error('Erro no parser Nubank:', nuErr);
       // Ignora erro de parse do Nubank e segue para outros formatos
     }
 
