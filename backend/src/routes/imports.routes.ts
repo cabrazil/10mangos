@@ -490,8 +490,14 @@ export async function importRoutes(app: FastifyInstance) {
         let inserted = 0;
         let skipped = 0;
 
+        const occurrences = new Map<string, number>();
+
         for (let i = 0; i < nubankParsed.transactions.length; i++) {
           const trn = nubankParsed.transactions[i];
+          const occKey = `${trn.rawDate}_${trn.amount}_${trn.description}`;
+          const occIndex = (occurrences.get(occKey) || 0) + 1;
+          occurrences.set(occKey, occIndex);
+
           let amount = trn.amount;
           let type: TransactionType = TransactionType.EXPENSE;
 
@@ -542,13 +548,21 @@ export async function importRoutes(app: FastifyInstance) {
             }
           }
 
-          const importHash = crypto
+          const legacyHash = crypto
             .createHash('sha256')
             .update(`${account.id}_${trn.rawDate}_${trn.amount}_${trn.description}_${i}`)
             .digest('hex');
 
+          const occHash = crypto
+            .createHash('sha256')
+            .update(`${account.id}_${trn.rawDate}_${trn.amount}_${trn.description}_#${occIndex}`)
+            .digest('hex');
+
           const existing = await prisma.transaction.findFirst({
-            where: { accountId: account.id, importHash },
+            where: {
+              accountId: account.id,
+              OR: [{ importHash: occHash }, { importHash: legacyHash }],
+            },
           });
 
           if (existing) {
@@ -568,7 +582,7 @@ export async function importRoutes(app: FastifyInstance) {
               competenceDate,
               description: trn.description,
               originalDescription: trn.description,
-              importHash,
+              importHash: occHash,
               categoryId,
               installmentNumber: trn.installmentNumber,
               createdById: userId,
