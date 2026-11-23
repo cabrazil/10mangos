@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useState } from "react";
-import { X, UploadCloud, FileSpreadsheet, CheckCircle2, AlertCircle, ArrowRight } from "lucide-react";
+import React, { useState, useEffect, useRef } from "react";
+import { X, UploadCloud, FileSpreadsheet, CheckCircle2, AlertCircle, ArrowRight, RotateCcw } from "lucide-react";
 
 interface ImportModalProps {
   isOpen: boolean;
@@ -16,6 +16,28 @@ export function ImportModal({ isOpen, onClose, accounts, onSuccess }: ImportModa
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<{ inserted: number; skipped: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Limpa o formulário sempre que o modal abre ou fecha
+  useEffect(() => {
+    if (isOpen) {
+      resetForm();
+    }
+  }, [isOpen]);
+
+  function resetForm() {
+    setFile(null);
+    setResult(null);
+    setError(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  function handleClose() {
+    resetForm();
+    onClose();
+  }
 
   if (!isOpen) return null;
 
@@ -48,6 +70,11 @@ export function ImportModal({ isOpen, onClose, accounts, onSuccess }: ImportModa
       if (!res.ok) throw new Error(data.error || "Erro ao processar importação");
 
       setResult({ inserted: data.inserted, skipped: data.skipped });
+      // Limpa o arquivo selecionado após a importação ser concluída
+      setFile(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
       onSuccess?.();
     } catch (err: any) {
       setError(err.message || "Falha na importação");
@@ -65,7 +92,7 @@ export function ImportModal({ isOpen, onClose, accounts, onSuccess }: ImportModa
             Importar Extrato / Fatura de Cartão
           </h2>
           <button
-            onClick={onClose}
+            onClick={handleClose}
             className="p-1 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800 transition-colors"
           >
             <X className="h-5 w-5" />
@@ -104,20 +131,35 @@ export function ImportModal({ isOpen, onClose, accounts, onSuccess }: ImportModa
                 </div>
               )}
               <input
+                ref={fileInputRef}
                 type="file"
                 accept=".xls,.xlsx,.csv,.ofx"
                 className="hidden"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
+                onChange={(e) => {
+                  setError(null);
+                  setResult(null);
+                  setFile(e.target.files?.[0] || null);
+                }}
               />
             </label>
           </div>
 
           {/* Feedback de Resultado */}
           {result && (
-            <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-300 space-y-1">
-              <div className="flex items-center gap-2 font-bold text-emerald-400">
-                <CheckCircle2 className="h-4 w-4" />
-                Importação Concluída!
+            <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-300 space-y-2">
+              <div className="flex items-center justify-between font-bold text-emerald-400">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="h-4 w-4" />
+                  <span>Importação Concluída!</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={resetForm}
+                  className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-400/80 hover:text-emerald-300 transition-colors"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  <span>Importar outro</span>
+                </button>
               </div>
               <p>• {result.inserted} lançamentos inseridos com sucesso.</p>
               {result.skipped > 0 && <p>• {result.skipped} lançamentos já existentes foram ignorados.</p>}
@@ -135,7 +177,7 @@ export function ImportModal({ isOpen, onClose, accounts, onSuccess }: ImportModa
           <div className="pt-2 flex items-center justify-end gap-3">
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleClose}
               className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
             >
               Fechar
