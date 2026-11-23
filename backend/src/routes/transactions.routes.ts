@@ -4,7 +4,7 @@ import { TransactionType, TransactionStatus, TransactionSource, AccountType, Tra
 import { addMonths, startOfMonth } from 'date-fns';
 import { prisma } from '../lib/prisma.js';
 
-function parseDateSafely(dateInput: string | Date | undefined): Date | undefined {
+function parseDateSafely(dateInput: string | Date | null | undefined): Date | undefined {
   if (!dateInput) return undefined;
   if (dateInput instanceof Date) return dateInput;
   const clean = dateInput.split('T')[0];
@@ -388,7 +388,7 @@ export async function transactionRoutes(app: FastifyInstance) {
         categoryId: data.categoryId,
         payeeId,
         invoiceId,
-        competenceDate: parseDateSafely(data.competenceDate),
+        competenceDate: data.competenceDate ? parseDateSafely(data.competenceDate) : null,
         notes: data.notes,
         createdById: userId,
       },
@@ -699,7 +699,7 @@ export async function transactionRoutes(app: FastifyInstance) {
           ...(data.status && { status: data.status }),
           ...(data.type && { type: data.type }),
           ...(data.date && { date: parseDateSafely(data.date) }),
-          ...(data.competenceDate !== undefined && { competenceDate: parseDateSafely(data.competenceDate) }),
+          ...(data.competenceDate !== undefined && { competenceDate: data.competenceDate ? parseDateSafely(data.competenceDate) : null }),
           ...(updatedAmount !== undefined && { amount: updatedAmount }),
           updatedById: userId,
         },

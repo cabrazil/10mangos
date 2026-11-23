@@ -279,11 +279,25 @@ export default function DashboardPage() {
   // Se a transação possui competenceDate (ex: alocada a uma fatura específica), usamos competenceDate; senão, usamos date
   const isTxInSelectedMonth = (tx: any) => {
     if (!tx) return false;
-    const refDate = tx.competenceDate || tx.date;
-    if (!refDate) return false;
-    const dStr = typeof refDate === "string" ? refDate.split("T")[0] : new Date(refDate).toISOString().split("T")[0];
-    const [y, m] = dStr.split("-").map(Number);
-    return y === currentDate.getFullYear() && m === currentDate.getMonth() + 1;
+    try {
+      const refDate = tx.competenceDate || tx.date;
+      if (!refDate) return false;
+      let dStr = "";
+      if (typeof refDate === "string") {
+        dStr = refDate.split("T")[0];
+      } else if (refDate instanceof Date && !isNaN(refDate.getTime())) {
+        dStr = refDate.toISOString().split("T")[0];
+      } else {
+        dStr = String(refDate).split("T")[0];
+      }
+      const parts = dStr.split("-");
+      if (parts.length < 2) return false;
+      const y = Number(parts[0]);
+      const m = Number(parts[1]);
+      return y === currentDate.getFullYear() && m === currentDate.getMonth() + 1;
+    } catch {
+      return false;
+    }
   };
 
   const monthlyTransactions = transactions.filter(isTxInSelectedMonth);
@@ -900,19 +914,27 @@ export default function DashboardPage() {
                             <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5 flex-wrap">
                               <span>{formatDate(tx.date)}</span>
                               {tx.competenceDate && (() => {
-                                const d1 = (typeof tx.date === "string" ? tx.date : new Date(tx.date).toISOString()).split("T")[0];
-                                const d2 = (typeof tx.competenceDate === "string" ? tx.competenceDate : new Date(tx.competenceDate).toISOString()).split("T")[0];
-                                const [y1, m1] = d1.split("-");
-                                const [y2, m2] = d2.split("-");
-                                if (y1 !== y2 || m1 !== m2) {
-                                  return (
-                                    <span
-                                      title={`Compra em ${formatDate(tx.date)} atribuída à fatura de ${m2}/${y2}`}
-                                      className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[10px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/25"
-                                    >
-                                      <Calendar className="h-2.5 w-2.5" /> Fatura {m2}/{y2}
-                                    </span>
-                                  );
+                                try {
+                                  const d1 = String(tx.date || "").split("T")[0];
+                                  const d2 = String(tx.competenceDate || "").split("T")[0];
+                                  const p1 = d1.split("-");
+                                  const p2 = d2.split("-");
+                                  if (p1.length >= 2 && p2.length >= 2) {
+                                    const [y1, m1] = p1;
+                                    const [y2, m2] = p2;
+                                    if (y1 !== y2 || m1 !== m2) {
+                                      return (
+                                        <span
+                                          title={`Compra em ${formatDate(tx.date)} atribuída à fatura de ${m2}/${y2}`}
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/25"
+                                        >
+                                          <Calendar className="h-2.5 w-2.5" /> Fatura {m2}/{y2}
+                                        </span>
+                                      );
+                                    }
+                                  }
+                                } catch {
+                                  // ignora erro de parse visual
                                 }
                                 return null;
                               })()}

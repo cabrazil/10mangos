@@ -14,11 +14,15 @@ export function formatCurrency(value: number, currency: string = "BRL") {
 
 export function formatDate(dateInput: string | Date | null | undefined): string {
   if (!dateInput) return "";
-  const str = typeof dateInput === "string" ? dateInput : dateInput.toISOString();
-  const datePart = str.split("T")[0];
-  const [year, month, day] = datePart.split("-");
-  if (!year || !month || !day) return "";
-  return `${day}/${month}/${year}`;
+  try {
+    const str = typeof dateInput === "string" ? dateInput : (dateInput instanceof Date && !isNaN(dateInput.getTime()) ? dateInput.toISOString() : String(dateInput));
+    const datePart = str.split("T")[0];
+    const [year, month, day] = datePart.split("-");
+    if (!year || !month || !day) return "";
+    return `${day}/${month}/${year}`;
+  } catch {
+    return "";
+  }
 }
 
 export function computeShiftedDate(currentDateStr: string, delta: -1 | 1): string {
