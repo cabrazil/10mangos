@@ -5,6 +5,7 @@ import * as xlsx from 'xlsx';
 import { ImportSource, ImportStatus, ImportRowStatus, TransactionSource, TransactionType, TransactionStatus, AccountType } from '@prisma/client';
 import { parseOfxString } from '../lib/ofx-parser.js';
 import { parseItauCardStatement } from '../lib/itau-card-parser.js';
+import { parseNubankCsv } from '../lib/nubank-parser.js';
 import { prisma } from '../lib/prisma.js';
 
 export async function importRoutes(app: FastifyInstance) {
@@ -482,7 +483,113 @@ export async function importRoutes(app: FastifyInstance) {
       });
     }
 
-    // 2. Se for Fatura de Cartão Itaú (.xlsx, .xls ou .csv)
+    // 2. Se for Fatura do Cartão Nubank (.csv com colunas date, title, amount)
+    try {
+      const nubankParsed = parseNubankCsv(buffer);
+      if (nubankParsed.isNubank && nubankParsed.transactions.length > 0) {
+        let inserted = 0;
+        let skipped = 0;
+
+        for (let i = 0; i < nubankParsed.transactions.length; i++) {
+          const trn = nubankParsed.transactions[i];
+          let amount = trn.amount;
+          let type: TransactionType = TransactionType.EXPENSE;
+
+          if (trn.isPayment) {
+            type = TransactionType.TRANSFER;
+            amount = Math.abs(trn.amount);
+          } else {
+            type = TransactionType.EXPENSE;
+            amount = -Math.abs(trn.amount);
+          }
+
+          const descLower = trn.description.toLowerCase();
+
+          // Categorização inteligente para compras Nubank
+          let categoryId: string | undefined = undefined;
+          for (const [name, id] of categoryMap.entries()) {
+            if (name.length > 2 && descLower.includes(name)) {
+              categoryId = id;
+              break;
+            }
+          }
+
+          if (!categoryId) {
+            if (/supermerc|mercado|carrefour|extra|pao de acucar|hortifruti|atacad|sonda|sitio verde|minimercado/i.test(trn.description)) {
+              categoryId = categoryMap.get('supermercado') || categoryMap.get('alimentação');
+            } else if (/ifood|ubereats|rappi|delivery/i.test(trn.description)) {
+              categoryId = categoryMap.get('ifood/viagem') || categoryMap.get('alimentação');
+            } else if (/uber|99app|99pop|taxi/i.test(trn.description)) {
+              categoryId = categoryMap.get('uber') || categoryMap.get('transporte');
+            } else if (/apple\.com|netflix|spotify|amazonprime|youtube|mubi|disney|globo/i.test(trn.description)) {
+              categoryId = categoryMap.get('assinaturas e serviços') || categoryMap.get('outros');
+            } else if (/farmacia|droga|raia|drogasil|pacheco|sao paulo/i.test(trn.description)) {
+              categoryId = categoryMap.get('farmácia') || categoryMap.get('saúde');
+            } else if (/posto|combustivel|ipiranga|shell|br distrib/i.test(trn.description)) {
+              categoryId = categoryMap.get('combustível') || categoryMap.get('transporte');
+            } else if (/nutag|pedagio|sem parar|veloe|conectcar/i.test(trn.description)) {
+              categoryId = categoryMap.get('pedágio') || categoryMap.get('transporte');
+            }
+          }
+
+          // Se for cartão de crédito e a compra ocorreu no final do mês anterior (dias 28-31),
+          // define a fatura de competência para o mês seguinte
+          let competenceDate: Date | null = null;
+          if (account.type === AccountType.CREDIT_CARD && !trn.isPayment) {
+            const day = trn.date.getUTCDate();
+            if (day >= 28) {
+              competenceDate = new Date(Date.UTC(trn.date.getUTCFullYear(), trn.date.getUTCMonth() + 1, 1, 12, 0, 0));
+            }
+          }
+
+          const importHash = crypto
+            .createHash('sha256')
+            .update(`${account.id}_${trn.rawDate}_${trn.amount}_${trn.description}_${i}`)
+            .digest('hex');
+
+          const existing = await prisma.transaction.findFirst({
+            where: { accountId: account.id, importHash },
+          });
+
+          if (existing) {
+            skipped++;
+            continue;
+          }
+
+          await prisma.transaction.create({
+            data: {
+              workspaceId,
+              accountId: account.id,
+              type,
+              status: TransactionStatus.CLEARED,
+              source: TransactionSource.EXCEL_IMPORT,
+              amount,
+              date: trn.date,
+              competenceDate,
+              description: trn.description,
+              originalDescription: trn.description,
+              importHash,
+              categoryId,
+              installmentNumber: trn.installmentNumber,
+              installmentCount: trn.installmentCount,
+              createdById: userId,
+            },
+          });
+
+          inserted++;
+        }
+
+        return reply.send({
+          message: 'Fatura de Cartão Nubank importada com sucesso',
+          inserted,
+          skipped,
+        });
+      }
+    } catch (nuErr) {
+      // Ignora erro de parse do Nubank e segue para outros formatos
+    }
+
+    // 3. Se for Fatura de Cartão Itaú (.xlsx, .xls ou .csv)
     try {
       const itauCardParsed = parseItauCardStatement(buffer);
       if (itauCardParsed.isItauCard && itauCardParsed.transactions.length > 0) {
