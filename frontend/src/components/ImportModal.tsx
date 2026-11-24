@@ -1,32 +1,195 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
-import { X, UploadCloud, FileSpreadsheet, CheckCircle2, AlertCircle, ArrowRight, RotateCcw } from "lucide-react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
+import {
+  X,
+  UploadCloud,
+  FileSpreadsheet,
+  CheckCircle2,
+  AlertCircle,
+  ArrowRight,
+  RotateCcw,
+  Link2,
+  PlusCircle,
+  Ban,
+  Sparkles,
+  ArrowLeft,
+  Check,
+  ArrowRightLeft,
+  ShieldCheck,
+} from "lucide-react";
+import { formatCurrency, formatDate } from "@/lib/utils";
+
+interface CategoryOption {
+  id: string;
+  name: string;
+  type?: string;
+  parentId?: string | null;
+  parent?: { id: string; name: string } | null;
+  children?: CategoryOption[];
+}
+
+interface CandidateTransaction {
+  id: string;
+  date: string;
+  amount: number;
+  description: string;
+  status: "PENDING" | "CLEARED" | "RECONCILED";
+  source: string;
+  fitId?: string | null;
+  categoryId?: string | null;
+  categoryName?: string | null;
+}
+
+interface PreviewItem {
+  tempId: string;
+  rowNumber: number;
+  date: string;
+  competenceDate: string | null;
+  amount: number;
+  type: "INCOME" | "EXPENSE" | "TRANSFER" | "ADJUSTMENT";
+  status: "CLEARED" | "PENDING";
+  source: "OFX_IMPORT" | "EXCEL_IMPORT";
+  description: string;
+  originalDescription: string;
+  fitId: string | null;
+  importHash: string;
+  legacyHash: string | null;
+  installmentNumber: number | null;
+  notes: string | null;
+  suggestedCategoryId: string | null;
+  suggestedCategoryName: string | null;
+  matchStatus: "DUPLICATE" | "MATCH" | "NEW";
+  defaultAction: "IGNORE" | "RECONCILE" | "CREATE";
+  matchedTransaction: CandidateTransaction | null;
+  matchScore: number;
+  matchMethod: "FITID" | "AUTO_EXACT" | "AUTO_FUZZY" | null;
+  matchReason: string | null;
+}
+
+interface EditableReconciliationItem extends PreviewItem {
+  action: "RECONCILE" | "CREATE" | "IGNORE";
+  selectedTransactionId: string | null;
+  keepExistingDescription: boolean;
+  customDescription: string;
+  selectedCategoryId: string | null;
+}
+
+interface PreviewResponse {
+  account: {
+    id: string;
+    name: string;
+    type: string;
+    currency: string;
+    currentBalance: number;
+    projectedBalance: number;
+  };
+  fileName: string;
+  format: string;
+  formatLabel: string;
+  ledgerBalance: number | null;
+  balanceDate: string | null;
+  periodStart: string | null;
+  periodEnd: string | null;
+  summary: {
+    total: number;
+    matched: number;
+    newItems: number;
+    duplicates: number;
+  };
+  items: PreviewItem[];
+  availableCandidates: CandidateTransaction[];
+}
 
 interface ImportModalProps {
   isOpen: boolean;
   onClose: () => void;
-  accounts: Array<{ id: string; name: string }>;
+  accounts: Array<{ id: string; name: string; type?: string; currency?: string }>;
+  categories?: CategoryOption[];
+  defaultAccountId?: string;
   onSuccess?: () => void;
 }
 
-export function ImportModal({ isOpen, onClose, accounts, onSuccess }: ImportModalProps) {
-  const [selectedAccount, setSelectedAccount] = useState(accounts[0]?.id || "");
+export function ImportModal({
+  isOpen,
+  onClose,
+  accounts,
+  categories = [],
+  defaultAccountId,
+  onSuccess,
+}: ImportModalProps) {
+  const [selectedAccount, setSelectedAccount] = useState(defaultAccountId || accounts[0]?.id || "");
   const [file, setFile] = useState<File | null>(null);
+  const [step, setStep] = useState<"UPLOAD" | "REVIEW" | "DONE">("UPLOAD");
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<{ inserted: number; skipped: number } | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [previewData, setPreviewData] = useState<PreviewResponse | null>(null);
+  const [rows, setRows] = useState<EditableReconciliationItem[]>([]);
+  const [filterTab, setFilterTab] = useState<"ALL" | "RECONCILE" | "CREATE" | "IGNORE">("ALL");
+  const [result, setResult] = useState<{
+    reconciled: number;
+    created: number;
+    ignored: number;
+    newBalance?: number | null;
+    accountCurrency?: string;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Limpa o formulário sempre que o modal abre ou fecha
   useEffect(() => {
     if (isOpen) {
       resetForm();
+      if (defaultAccountId) {
+        setSelectedAccount(defaultAccountId);
+      } else if (accounts[0]?.id && !selectedAccount) {
+        setSelectedAccount(accounts[0].id);
+      }
     }
-  }, [isOpen]);
+  }, [isOpen, defaultAccountId]);
+
+  // Achatar categorias para select simples com hierarquia "Pai > Filho"
+  const flatCategories = useMemo(() => {
+    const list: Array<{ id: string; label: string }> = [];
+    const parents = categories.filter((c) => !c.parentId);
+    for (const p of parents) {
+      list.push({ id: p.id, label: p.name });
+      const children = p.children || categories.filter((c) => c.parentId === p.id);
+      for (const ch of children) {
+        list.push({ id: ch.id, label: `${p.name} › ${ch.name}` });
+      }
+    }
+    if (list.length === 0) {
+      for (const c of categories) {
+        list.push({
+          id: c.id,
+          label: c.parent ? `${c.parent.name} › ${c.name}` : c.name,
+        });
+      }
+    }
+    return list;
+  }, [categories]);
+
+  const candidatesMap = useMemo(() => {
+    const map = new Map<string, CandidateTransaction>();
+    if (previewData) {
+      for (const c of previewData.availableCandidates) {
+        map.set(c.id, c);
+      }
+      for (const it of previewData.items) {
+        if (it.matchedTransaction) {
+          map.set(it.matchedTransaction.id, it.matchedTransaction);
+        }
+      }
+    }
+    return map;
+  }, [previewData]);
 
   function resetForm() {
     setFile(null);
+    setStep("UPLOAD");
+    setPreviewData(null);
+    setRows([]);
+    setFilterTab("ALL");
     setResult(null);
     setError(null);
     if (fileInputRef.current) {
@@ -39,17 +202,15 @@ export function ImportModal({ isOpen, onClose, accounts, onSuccess }: ImportModa
     onClose();
   }
 
-  if (!isOpen) return null;
-
-  async function handleImport() {
+  // Passo 1: Analisar arquivo e gerar preview de conciliação inteligente
+  async function handlePreview() {
     if (!file || !selectedAccount) {
-      alert("Selecione um arquivo e a conta de destino");
+      setError("Selecione um arquivo e a conta de destino.");
       return;
     }
 
     setLoading(true);
     setError(null);
-    setResult(null);
 
     const formData = new FormData();
     formData.append("file", file);
@@ -58,7 +219,7 @@ export function ImportModal({ isOpen, onClose, accounts, onSuccess }: ImportModa
     const token = localStorage.getItem("token");
 
     try {
-      const res = await fetch("http://localhost:3333/api/imports/organizze-csv", {
+      const res = await fetch("http://localhost:3333/api/imports/preview", {
         method: "POST",
         headers: {
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -67,132 +228,722 @@ export function ImportModal({ isOpen, onClose, accounts, onSuccess }: ImportModa
       });
 
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Erro ao processar importação");
+      if (!res.ok) throw new Error(data.error || "Erro ao analisar extrato para conciliação");
 
-      setResult({ inserted: data.inserted, skipped: data.skipped });
-      // Limpa o arquivo selecionado após a importação ser concluída
-      setFile(null);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
-      onSuccess?.();
+      const preview: PreviewResponse = data;
+      setPreviewData(preview);
+
+      const editable: EditableReconciliationItem[] = preview.items.map((item) => ({
+        ...item,
+        action: item.defaultAction,
+        selectedTransactionId: item.matchedTransaction?.id || null,
+        keepExistingDescription: true,
+        customDescription: item.description,
+        selectedCategoryId: item.matchedTransaction?.categoryId || item.suggestedCategoryId || null,
+      }));
+
+      setRows(editable);
+      setStep("REVIEW");
     } catch (err: any) {
-      setError(err.message || "Falha na importação");
+      setError(err.message || "Falha ao analisar arquivo");
     } finally {
       setLoading(false);
     }
   }
 
+  // Passo 2: Confirmar conciliação e gravar decisões
+  async function handleConfirmReconciliation() {
+    if (!previewData) return;
+
+    setConfirming(true);
+    setError(null);
+
+    const token = localStorage.getItem("token");
+
+    try {
+      const payload = {
+        accountId: previewData.account.id,
+        fileName: previewData.fileName,
+        format: previewData.format,
+        ledgerBalance: previewData.ledgerBalance,
+        items: rows.map((r) => ({
+          tempId: r.tempId,
+          action: r.action,
+          matchedTransactionId: r.action === "RECONCILE" ? r.selectedTransactionId : null,
+          keepExistingDescription: r.keepExistingDescription,
+          date: r.date,
+          competenceDate: r.competenceDate,
+          amount: r.amount,
+          type: r.type,
+          source: r.source,
+          description: r.action === "CREATE" ? r.customDescription : r.description,
+          originalDescription: r.originalDescription,
+          fitId: r.fitId,
+          importHash: r.importHash,
+          categoryId: r.selectedCategoryId || null,
+          installmentNumber: r.installmentNumber,
+          notes: r.notes,
+        })),
+      };
+
+      const res = await fetch("http://localhost:3333/api/imports/confirm-reconciliation", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Erro ao confirmar conciliação");
+
+      setResult({
+        reconciled: data.reconciled ?? 0,
+        created: data.created ?? 0,
+        ignored: data.ignored ?? 0,
+        newBalance: data.account?.currentBalance ?? null,
+        accountCurrency: previewData.account.currency || "BRL",
+      });
+      setStep("DONE");
+      onSuccess?.();
+    } catch (err: any) {
+      setError(err.message || "Falha ao confirmar conciliação");
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  function updateRow(tempId: string, patch: Partial<EditableReconciliationItem>) {
+    setRows((prev) =>
+      prev.map((r) => {
+        if (r.tempId !== tempId) return r;
+        const updated = { ...r, ...patch };
+        // Se mudou para RECONCILE e ainda não tem transação selecionada, tenta pré-selecionar a melhor candidata de mesmo sinal
+        if (patch.action === "RECONCILE" && !updated.selectedTransactionId && previewData) {
+          const sameSignCandidate = previewData.availableCandidates.find(
+            (c) => (r.amount < 0 && c.amount < 0) || (r.amount >= 0 && c.amount >= 0)
+          );
+          if (sameSignCandidate) {
+            updated.selectedTransactionId = sameSignCandidate.id;
+          }
+        }
+        return updated;
+      })
+    );
+  }
+
+  // Contadores e simulação de saldo em tempo real
+  const stats = useMemo(() => {
+    let reconcileCount = 0;
+    let createCount = 0;
+    let ignoreCount = 0;
+    let balanceDelta = 0;
+
+    for (const r of rows) {
+      if (r.action === "RECONCILE") {
+        reconcileCount++;
+        const targetTx = r.selectedTransactionId ? candidatesMap.get(r.selectedTransactionId) : null;
+        if (targetTx) {
+          if (targetTx.status === "PENDING") {
+            // Passará de PENDING para CLEARED -> entra no saldo atual pelo valor do extrato
+            balanceDelta += r.amount;
+          } else {
+            // Já estava CLEARED -> só altera o saldo se o valor do extrato for diferente do valor que estava lançado
+            balanceDelta += r.amount - targetTx.amount;
+          }
+        } else {
+          balanceDelta += r.amount;
+        }
+      } else if (r.action === "CREATE") {
+        createCount++;
+        balanceDelta += r.amount;
+      } else {
+        ignoreCount++;
+      }
+    }
+
+    const currentBalance = previewData?.account.currentBalance ?? 0;
+    const simulatedBalance = currentBalance + balanceDelta;
+
+    return {
+      reconcileCount,
+      createCount,
+      ignoreCount,
+      balanceDelta,
+      currentBalance,
+      simulatedBalance,
+    };
+  }, [rows, previewData, candidatesMap]);
+
+  const filteredRows = useMemo(() => {
+    if (filterTab === "ALL") return rows;
+    return rows.filter((r) => r.action === filterTab);
+  }, [rows, filterTab]);
+
+  if (!isOpen) return null;
+
+  const accountCurrency = previewData?.account.currency || "BRL";
+
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150">
-        <div className="flex items-center justify-between p-5 border-b border-slate-800">
-          <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
-            <UploadCloud className="h-5 w-5 text-emerald-400" />
-            Importar Extrato / Fatura de Cartão
-          </h2>
+    <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4">
+      <div
+        className={`bg-slate-900 border border-slate-800 rounded-2xl w-full shadow-2xl overflow-hidden flex flex-col transition-all duration-200 ${
+          step === "REVIEW" ? "max-w-5xl max-h-[92vh]" : "max-w-md"
+        }`}
+      >
+        {/* Cabeçalho */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800 bg-slate-900/90">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+              <UploadCloud className="h-5 w-5 text-emerald-400" />
+            </div>
+            <div>
+              <h2 className="text-sm sm:text-base font-bold text-slate-100 flex items-center gap-2">
+                {step === "UPLOAD" && "Importar e Conciliar Extrato / Fatura"}
+                {step === "REVIEW" && (
+                  <>
+                    <span>Conciliação Bancária Inteligente</span>
+                    <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                      {previewData?.account.name}
+                    </span>
+                  </>
+                )}
+                {step === "DONE" && "Conciliação Concluída"}
+              </h2>
+              {step === "REVIEW" && previewData && (
+                <p className="text-[11px] text-slate-400">
+                  {previewData.formatLabel} • <span className="text-slate-300">{previewData.fileName}</span>
+                  {previewData.periodStart && previewData.periodEnd && (
+                    <span>
+                      {" "}
+                      • Período: {formatDate(previewData.periodStart)} a {formatDate(previewData.periodEnd)}
+                    </span>
+                  )}
+                </p>
+              )}
+            </div>
+          </div>
           <button
             onClick={handleClose}
-            className="p-1 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800 transition-colors"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800 transition-colors"
           >
             <X className="h-5 w-5" />
           </button>
         </div>
 
-        <div className="p-6 space-y-5">
-          {/* Conta Alvo */}
-          <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-400">Conta de Destino</label>
-            <select
-              value={selectedAccount}
-              onChange={(e) => setSelectedAccount(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm text-slate-100 focus:outline-none focus:border-emerald-500"
-            >
-              {accounts.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.name}
-                </option>
-              ))}
-            </select>
-          </div>
+        {/* ETAPA 1: UPLOAD DO ARQUIVO */}
+        {step === "UPLOAD" && (
+          <div className="p-6 space-y-5">
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-400">Conta ou Cartão de Destino</label>
+              <select
+                value={selectedAccount}
+                onChange={(e) => setSelectedAccount(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm text-slate-100 focus:outline-none focus:border-emerald-500"
+              >
+                {accounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name}
+                  </option>
+                ))}
+              </select>
+            </div>
 
-          {/* Área de Upload / Dropzone */}
-          <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-400">Arquivo (.xls, .xlsx, .csv ou .ofx)</label>
-            <label className="border-2 border-dashed border-slate-800 hover:border-emerald-500/50 rounded-2xl p-6 flex flex-col items-center justify-center gap-2 cursor-pointer transition-colors bg-slate-950/40">
-              <FileSpreadsheet className="h-8 w-8 text-slate-400" />
-              <div className="text-center">
-                <span className="text-xs font-semibold text-emerald-400">Clique para selecionar</span>
-                <span className="text-xs text-slate-500 block">ou arraste o extrato .ofx, fatura .xlsx ou planilha aqui</span>
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-400">
+                Arquivo do Extrato ou Fatura (.ofx, .csv, .xls, .xlsx)
+              </label>
+              <label className="border-2 border-dashed border-slate-800 hover:border-emerald-500/50 rounded-2xl p-6 flex flex-col items-center justify-center gap-2 cursor-pointer transition-colors bg-slate-950/40">
+                <FileSpreadsheet className="h-8 w-8 text-slate-400" />
+                <div className="text-center">
+                  <span className="text-xs font-semibold text-emerald-400">Clique para selecionar</span>
+                  <span className="text-xs text-slate-500 block">
+                    ou arraste o extrato .ofx, fatura .xlsx/.csv ou planilha aqui
+                  </span>
+                </div>
+                {file && (
+                  <div className="mt-2 px-3 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs font-medium text-emerald-400">
+                    {file.name}
+                  </div>
+                )}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".xls,.xlsx,.csv,.ofx"
+                  className="hidden"
+                  onChange={(e) => {
+                    setError(null);
+                    setFile(e.target.files?.[0] || null);
+                  }}
+                />
+              </label>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800/80 text-[11px] text-slate-400 space-y-1">
+              <div className="font-semibold text-slate-300 flex items-center gap-1.5">
+                <Sparkles className="h-3.5 w-3.5 text-emerald-400" />
+                <span>Como funciona a Conciliação Inteligente:</span>
               </div>
-              {file && (
-                <div className="mt-2 px-3 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs font-medium text-emerald-400">
-                  {file.name}
-                </div>
-              )}
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".xls,.xlsx,.csv,.ofx"
-                className="hidden"
-                onChange={(e) => {
-                  setError(null);
-                  setResult(null);
-                  setFile(e.target.files?.[0] || null);
-                }}
-              />
-            </label>
-          </div>
+              <p>
+                • Cruza automaticamente o extrato com seus <strong>lançamentos fixos/previstos</strong> e manuais para{" "}
+                <strong>evitar duplicidades</strong>.
+              </p>
+              <p>• Efetiva contas previstas mantendo suas descrições e categorias personalizadas.</p>
+              <p>• Sugere categorias automaticamente para os novos gastos do período.</p>
+            </div>
 
-          {/* Feedback de Resultado */}
-          {result && (
-            <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-300 space-y-2">
-              <div className="flex items-center justify-between font-bold text-emerald-400">
-                <div className="flex items-center gap-2">
-                  <CheckCircle2 className="h-4 w-4" />
-                  <span>Importação Concluída!</span>
-                </div>
+            {error && (
+              <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-xs text-rose-300 flex items-center gap-2">
+                <AlertCircle className="h-4 w-4 text-rose-400 flex-shrink-0" />
+                <span>{error}</span>
+              </div>
+            )}
+
+            <div className="pt-1 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={handleClose}
+                className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handlePreview}
+                disabled={loading || !file}
+                className="px-5 py-2.5 rounded-xl text-xs font-bold bg-emerald-500 hover:bg-emerald-600 text-slate-950 shadow-md shadow-emerald-500/20 transition-all hover:scale-[1.01] active:scale-[0.99] disabled:opacity-50 flex items-center gap-2"
+              >
+                {loading ? "Analisando Extrato..." : "Analisar e Conciliar"}
+                <ArrowRight className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ETAPA 2: MESA DE REVISÃO E CONCILIAÇÃO */}
+        {step === "REVIEW" && previewData && (
+          <>
+            {/* Barra de Resumo & Simulação de Saldo */}
+            <div className="px-5 py-3.5 bg-slate-950/60 border-b border-slate-800 space-y-3">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
                 <button
                   type="button"
-                  onClick={resetForm}
-                  className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-400/80 hover:text-emerald-300 transition-colors"
+                  onClick={() => setFilterTab("ALL")}
+                  className={`p-2.5 rounded-xl border text-left transition-all ${
+                    filterTab === "ALL"
+                      ? "bg-slate-800/90 border-slate-600 text-slate-100"
+                      : "bg-slate-900/60 border-slate-800/80 text-slate-400 hover:bg-slate-800/40"
+                  }`}
                 >
-                  <RotateCcw className="h-3 w-3" />
-                  <span>Importar outro</span>
+                  <div className="text-[11px] font-medium text-slate-400">Total no Arquivo</div>
+                  <div className="text-base font-bold text-slate-100">{rows.length} linhas</div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setFilterTab("RECONCILE")}
+                  className={`p-2.5 rounded-xl border text-left transition-all ${
+                    filterTab === "RECONCILE"
+                      ? "bg-cyan-500/15 border-cyan-500/50 text-cyan-200"
+                      : "bg-slate-900/60 border-slate-800/80 text-slate-400 hover:bg-slate-800/40"
+                  }`}
+                >
+                  <div className="text-[11px] font-medium text-cyan-400 flex items-center gap-1">
+                    <Link2 className="h-3 w-3" />
+                    <span>Conciliados (Match)</span>
+                  </div>
+                  <div className="text-base font-bold text-cyan-300">{stats.reconcileCount}</div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setFilterTab("CREATE")}
+                  className={`p-2.5 rounded-xl border text-left transition-all ${
+                    filterTab === "CREATE"
+                      ? "bg-emerald-500/15 border-emerald-500/50 text-emerald-200"
+                      : "bg-slate-900/60 border-slate-800/80 text-slate-400 hover:bg-slate-800/40"
+                  }`}
+                >
+                  <div className="text-[11px] font-medium text-emerald-400 flex items-center gap-1">
+                    <PlusCircle className="h-3 w-3" />
+                    <span>Criar Novos</span>
+                  </div>
+                  <div className="text-base font-bold text-emerald-300">{stats.createCount}</div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setFilterTab("IGNORE")}
+                  className={`p-2.5 rounded-xl border text-left transition-all ${
+                    filterTab === "IGNORE"
+                      ? "bg-slate-800 border-slate-600 text-slate-200"
+                      : "bg-slate-900/60 border-slate-800/80 text-slate-400 hover:bg-slate-800/40"
+                  }`}
+                >
+                  <div className="text-[11px] font-medium text-slate-400 flex items-center gap-1">
+                    <Ban className="h-3 w-3" />
+                    <span>Já Importados / Ignorados</span>
+                  </div>
+                  <div className="text-base font-bold text-slate-300">{stats.ignoreCount}</div>
                 </button>
               </div>
-              <p>• {result.inserted} lançamentos inseridos com sucesso.</p>
-              {result.skipped > 0 && <p>• {result.skipped} lançamentos já existentes foram ignorados.</p>}
-            </div>
-          )}
 
-          {error && (
-            <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-xs text-rose-300 flex items-center gap-2">
-              <AlertCircle className="h-4 w-4 text-rose-400 flex-shrink-0" />
-              <span>{error}</span>
-            </div>
-          )}
+              {/* Simulador de Saldo da Conta */}
+              <div className="flex flex-wrap items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs">
+                <div className="flex flex-wrap items-center gap-4">
+                  <div>
+                    <span className="text-slate-400">Saldo Atual no 10mangos: </span>
+                    <span className="font-bold text-slate-200">
+                      {formatCurrency(stats.currentBalance, accountCurrency)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Impacto Líquido: </span>
+                    <span
+                      className={`font-bold ${
+                        stats.balanceDelta > 0
+                          ? "text-emerald-400"
+                          : stats.balanceDelta < 0
+                          ? "text-rose-400"
+                          : "text-slate-300"
+                      }`}
+                    >
+                      {stats.balanceDelta >= 0 ? "+" : ""}
+                      {formatCurrency(stats.balanceDelta, accountCurrency)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Saldo Pós-Conciliação: </span>
+                    <span className="font-bold text-emerald-400">
+                      {formatCurrency(stats.simulatedBalance, accountCurrency)}
+                    </span>
+                  </div>
+                </div>
 
-          {/* Botões */}
-          <div className="pt-2 flex items-center justify-end gap-3">
-            <button
-              type="button"
-              onClick={handleClose}
-              className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
-            >
-              Fechar
-            </button>
-            <button
-              type="button"
-              onClick={handleImport}
-              disabled={loading || !file}
-              className="px-6 py-2.5 rounded-xl text-xs font-bold bg-emerald-500 hover:bg-emerald-600 text-slate-950 shadow-md shadow-emerald-500/20 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 flex items-center gap-2"
-            >
-              {loading ? "Processando..." : "Importar Agora"}
-              <ArrowRight className="h-3.5 w-3.5" />
-            </button>
+                {previewData.ledgerBalance !== null && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-slate-400">Saldo OFX do Banco:</span>
+                    <span className="font-bold text-slate-200">
+                      {formatCurrency(previewData.ledgerBalance, accountCurrency)}
+                    </span>
+                    {Math.abs(stats.simulatedBalance - previewData.ledgerBalance) < 0.01 ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                        <ShieldCheck className="h-3 w-3" />
+                        Bateu 100%
+                      </span>
+                    ) : null}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Lista de Linhas para Conciliação */}
+            <div className="flex-1 overflow-y-auto divide-y divide-slate-800/70 px-5 py-2">
+              {filteredRows.length === 0 ? (
+                <div className="py-12 text-center text-xs text-slate-500">
+                  Nenhuma linha do extrato nesta categoria de filtro.
+                </div>
+              ) : (
+                filteredRows.map((row) => {
+                  const linkedTx = row.selectedTransactionId
+                    ? candidatesMap.get(row.selectedTransactionId)
+                    : null;
+
+                  // Candidatos do mesmo sinal (despesa com despesa, receita com receita) para troca manual
+                  const compatibleCandidates = previewData.availableCandidates.filter(
+                    (c) => (row.amount < 0 && c.amount < 0) || (row.amount >= 0 && c.amount >= 0)
+                  );
+
+                  return (
+                    <div
+                      key={row.tempId}
+                      className={`py-3 flex flex-col lg:flex-row lg:items-center justify-between gap-3 transition-colors ${
+                        row.action === "IGNORE" ? "opacity-55" : ""
+                      }`}
+                    >
+                      {/* Coluna 1: Linha do Extrato (Banco) */}
+                      <div className="lg:w-[36%] min-w-0 space-y-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[11px] font-mono text-slate-400 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">
+                            {formatDate(row.date)}
+                          </span>
+                          <span
+                            className={`text-xs font-bold ${
+                              row.amount >= 0 ? "text-emerald-400" : "text-rose-400"
+                            }`}
+                          >
+                            {row.amount >= 0 ? "+" : ""}
+                            {formatCurrency(row.amount, accountCurrency)}
+                          </span>
+                          {row.matchStatus === "MATCH" && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                              <Link2 className="h-2.5 w-2.5" />
+                              Match {row.matchScore}%
+                            </span>
+                          )}
+                          {row.matchStatus === "DUPLICATE" && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400 border border-slate-700">
+                              Já importado
+                            </span>
+                          )}
+                          {row.matchStatus === "NEW" && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                              Novo
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs font-medium text-slate-200 truncate" title={row.originalDescription}>
+                          {row.originalDescription}
+                        </div>
+                        {row.matchReason && (
+                          <div className="text-[11px] text-slate-400 truncate" title={row.matchReason}>
+                            {row.matchReason}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Coluna 2: Seletor de Ação */}
+                      <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 self-start lg:self-center flex-shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => updateRow(row.tempId, { action: "RECONCILE" })}
+                          disabled={compatibleCandidates.length === 0 && !row.matchedTransaction}
+                          title={
+                            compatibleCandidates.length === 0
+                              ? "Nenhum lançamento existente de mesmo sinal no período para vincular"
+                              : "Conciliar com lançamento já existente no 10mangos (evita duplicar)"
+                          }
+                          className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold flex items-center gap-1 transition-all disabled:opacity-30 ${
+                            row.action === "RECONCILE"
+                              ? "bg-cyan-500 text-slate-950 shadow-sm"
+                              : "text-slate-400 hover:text-slate-200"
+                          }`}
+                        >
+                          <Link2 className="h-3 w-3" />
+                          <span>Conciliar</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => updateRow(row.tempId, { action: "CREATE" })}
+                          className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold flex items-center gap-1 transition-all ${
+                            row.action === "CREATE"
+                              ? "bg-emerald-500 text-slate-950 shadow-sm"
+                              : "text-slate-400 hover:text-slate-200"
+                          }`}
+                        >
+                          <PlusCircle className="h-3 w-3" />
+                          <span>Criar Novo</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => updateRow(row.tempId, { action: "IGNORE" })}
+                          className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold flex items-center gap-1 transition-all ${
+                            row.action === "IGNORE"
+                              ? "bg-slate-700 text-slate-100 shadow-sm"
+                              : "text-slate-400 hover:text-slate-200"
+                          }`}
+                        >
+                          <Ban className="h-3 w-3" />
+                          <span>Ignorar</span>
+                        </button>
+                      </div>
+
+                      {/* Coluna 3: Destino / Configuração no 10mangos */}
+                      <div className="lg:w-[40%] min-w-0">
+                        {row.action === "RECONCILE" && (
+                          <div className="p-2.5 rounded-xl bg-cyan-500/5 border border-cyan-500/20 space-y-1.5">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[10px] font-semibold uppercase tracking-wider text-cyan-400">
+                                Vincular ao lançamento existente:
+                              </span>
+                              {linkedTx && (
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                                    linkedTx.status === "PENDING"
+                                      ? "bg-amber-500/15 text-amber-300 border border-amber-500/30"
+                                      : "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
+                                  }`}
+                                >
+                                  {linkedTx.status === "PENDING" ? "Previsto → Efetivar" : "Já Efetivado (Não duplica)"}
+                                </span>
+                              )}
+                            </div>
+
+                            <select
+                              value={row.selectedTransactionId || ""}
+                              onChange={(e) =>
+                                updateRow(row.tempId, { selectedTransactionId: e.target.value || null })
+                              }
+                              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-100 focus:outline-none focus:border-cyan-500"
+                            >
+                              {compatibleCandidates.map((cand) => (
+                                <option key={cand.id} value={cand.id}>
+                                  {formatDate(cand.date)} • {cand.description} ({formatCurrency(cand.amount, accountCurrency)}){" "}
+                                  {cand.status === "PENDING" ? "[Previsto]" : "[Efetivado]"}
+                                </option>
+                              ))}
+                            </select>
+
+                            {linkedTx && (
+                              <label className="flex items-center gap-2 text-[11px] text-slate-300 cursor-pointer select-none pt-0.5">
+                                <input
+                                  type="checkbox"
+                                  checked={row.keepExistingDescription}
+                                  onChange={(e) =>
+                                    updateRow(row.tempId, { keepExistingDescription: e.target.checked })
+                                  }
+                                  className="rounded border-slate-700 bg-slate-950 text-cyan-500 focus:ring-0"
+                                />
+                                <span className="truncate">
+                                  Manter nome <strong>&ldquo;{linkedTx.description}&rdquo;</strong>
+                                  {linkedTx.categoryName ? ` (${linkedTx.categoryName})` : ""}
+                                </span>
+                              </label>
+                            )}
+                          </div>
+                        )}
+
+                        {row.action === "CREATE" && (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            <input
+                              type="text"
+                              value={row.customDescription}
+                              onChange={(e) => updateRow(row.tempId, { customDescription: e.target.value })}
+                              placeholder="Descrição do lançamento"
+                              className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-100 focus:outline-none focus:border-emerald-500"
+                            />
+
+                            {row.type === "TRANSFER" ? (
+                              <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-950/60 border border-slate-800 text-[11px] text-slate-400">
+                                <ArrowRightLeft className="h-3 w-3 text-slate-400 flex-shrink-0" />
+                                <span className="truncate">Movimentação / Transferência</span>
+                              </div>
+                            ) : (
+                              <select
+                                value={row.selectedCategoryId || ""}
+                                onChange={(e) =>
+                                  updateRow(row.tempId, { selectedCategoryId: e.target.value || null })
+                                }
+                                className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-100 focus:outline-none focus:border-emerald-500"
+                              >
+                                <option value="">Sem categoria</option>
+                                {flatCategories.map((cat) => (
+                                  <option key={cat.id} value={cat.id}>
+                                    {cat.label}
+                                  </option>
+                                ))}
+                              </select>
+                            )}
+                          </div>
+                        )}
+
+                        {row.action === "IGNORE" && (
+                          <div className="px-3 py-2 rounded-xl bg-slate-950/50 border border-slate-800/60 text-[11px] text-slate-500">
+                            Linha ignorada — não criará nem alterará lançamentos.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {error && (
+              <div className="mx-5 my-2 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-xs text-rose-300 flex items-center gap-2">
+                <AlertCircle className="h-4 w-4 text-rose-400 flex-shrink-0" />
+                <span>{error}</span>
+              </div>
+            )}
+
+            {/* Rodapé da Mesa de Conciliação */}
+            <div className="px-5 py-3.5 border-t border-slate-800 bg-slate-900/95 flex flex-wrap items-center justify-between gap-3">
+              <button
+                type="button"
+                onClick={() => setStep("UPLOAD")}
+                disabled={confirming}
+                className="px-3.5 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors flex items-center gap-1.5"
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+                <span>Trocar Arquivo</span>
+              </button>
+
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-slate-400 hidden sm:inline">
+                  <strong className="text-cyan-400">{stats.reconcileCount}</strong> conciliar •{" "}
+                  <strong className="text-emerald-400">{stats.createCount}</strong> criar •{" "}
+                  <strong className="text-slate-300">{stats.ignoreCount}</strong> ignorar
+                </span>
+
+                <button
+                  type="button"
+                  onClick={handleConfirmReconciliation}
+                  disabled={confirming}
+                  className="px-6 py-2.5 rounded-xl text-xs font-bold bg-emerald-500 hover:bg-emerald-600 text-slate-950 shadow-md shadow-emerald-500/20 transition-all hover:scale-[1.01] active:scale-[0.99] disabled:opacity-50 flex items-center gap-2"
+                >
+                  <Check className="h-4 w-4" />
+                  <span>{confirming ? "Aplicando Conciliação..." : "Confirmar Conciliação"}</span>
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ETAPA 3: RESULTADO FINAL */}
+        {step === "DONE" && result && (
+          <div className="p-6 space-y-5">
+            <div className="p-5 rounded-2xl bg-emerald-500/10 border border-emerald-500/25 space-y-3">
+              <div className="flex items-center gap-2.5 text-emerald-400 font-bold text-sm">
+                <CheckCircle2 className="h-5 w-5" />
+                <span>Conciliação Bancária Aplicada com Sucesso!</span>
+              </div>
+
+              <div className="space-y-1.5 text-xs text-slate-200">
+                <p className="flex items-center justify-between py-1 border-b border-slate-800/60">
+                  <span className="text-slate-400">🔗 Conciliados com previstos/manuais (sem duplicar):</span>
+                  <strong className="text-cyan-300">{result.reconciled}</strong>
+                </p>
+                <p className="flex items-center justify-between py-1 border-b border-slate-800/60">
+                  <span className="text-slate-400">➕ Novos lançamentos criados:</span>
+                  <strong className="text-emerald-300">{result.created}</strong>
+                </p>
+                <p className="flex items-center justify-between py-1 border-b border-slate-800/60">
+                  <span className="text-slate-400">🚫 Duplicados / ignorados:</span>
+                  <strong className="text-slate-300">{result.ignored}</strong>
+                </p>
+                {result.newBalance !== null && result.newBalance !== undefined && (
+                  <p className="flex items-center justify-between pt-2 text-sm">
+                    <span className="font-semibold text-slate-300">💰 Saldo Atualizado da Conta:</span>
+                    <strong className="text-emerald-400">
+                      {formatCurrency(result.newBalance, result.accountCurrency || "BRL")}
+                    </strong>
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={resetForm}
+                className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-300 hover:bg-slate-800 transition-colors flex items-center gap-1.5"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span>Conciliar Outro Arquivo</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleClose}
+                className="px-6 py-2.5 rounded-xl text-xs font-bold bg-emerald-500 hover:bg-emerald-600 text-slate-950 shadow-md shadow-emerald-500/20 transition-all"
+              >
+                Concluir e Fechar
+              </button>
+            </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

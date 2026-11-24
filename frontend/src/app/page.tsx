@@ -1174,6 +1174,8 @@ export default function DashboardPage() {
         isOpen={isImportOpen}
         onClose={() => setIsImportOpen(false)}
         accounts={accounts}
+        categories={categories}
+        defaultAccountId={accountFilter !== "ALL" && accountFilter !== "BANK_ACCOUNTS" && accountFilter !== "CREDIT_CARDS" ? accountFilter : undefined}
         onSuccess={() => {
           const token = localStorage.getItem("token");
           if (token) loadData(token, currentDate);

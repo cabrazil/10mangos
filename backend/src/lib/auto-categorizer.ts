@@ -50,13 +50,13 @@ export function isFinancialMovementDesc(normDesc: string): boolean {
   );
 }
 
-interface BuiltinRule {
+export interface BuiltinRule {
   parentName?: string;
   categoryName: string; // nome da subcategoria ou da categoria pai
   keywords: string[];
 }
 
-const BUILTIN_RULES: BuiltinRule[] = [
+export const BUILTIN_RULES: BuiltinRule[] = [
   // ALIMENTAÇÃO
   {
     parentName: 'Alimentação',
@@ -421,3 +421,74 @@ export async function runAutoCategorization(
     matchedTransactions,
   };
 }
+
+export function suggestCategoryFromMemory(
+  rawDesc: string,
+  amount: number,
+  accountId: string,
+  userRules: Array<any>,
+  categoryMap: Map<string, Category & { parent?: Category | null }>
+): { categoryId: string; categoryName: string } | null {
+  const normDesc = normalizeText(rawDesc);
+  if (!normDesc) return null;
+
+  for (const rule of userRules) {
+    if (!rule.categoryId) continue;
+    if (rule.accountId && rule.accountId !== accountId) continue;
+    if (rule.amountMin && amount < Number(rule.amountMin)) continue;
+    if (rule.amountMax && amount > Number(rule.amountMax)) continue;
+
+    const rulePattern = rule.caseSensitive ? rule.pattern : normalizeText(rule.pattern);
+    const textToMatch = rule.caseSensitive ? rawDesc : normDesc;
+
+    let isMatch = false;
+    if (rule.matchType === 'CONTAINS') {
+      isMatch = textToMatch.includes(rulePattern);
+    } else if (rule.matchType === 'STARTS_WITH') {
+      isMatch = textToMatch.startsWith(rulePattern);
+    } else if (rule.matchType === 'ENDS_WITH') {
+      isMatch = textToMatch.endsWith(rulePattern);
+    } else if (rule.matchType === 'EQUALS') {
+      isMatch = textToMatch === rulePattern;
+    } else if (rule.matchType === 'REGEX') {
+      try {
+        const reg = new RegExp(rule.pattern, rule.caseSensitive ? undefined : 'i');
+        isMatch = reg.test(rawDesc);
+      } catch {
+        isMatch = false;
+      }
+    }
+
+    if (isMatch) {
+      return {
+        categoryId: rule.categoryId,
+        categoryName: rule.category?.name || 'Regra Personalizada',
+      };
+    }
+  }
+
+  if (!isFinancialMovementDesc(normDesc)) {
+    for (const builtin of BUILTIN_RULES) {
+      const foundKeyword = builtin.keywords.find((kw) => normDesc.includes(kw));
+      if (foundKeyword) {
+        let targetCat: (Category & { parent?: Category | null }) | undefined;
+        if (builtin.parentName) {
+          const fullKey = `${normalizeText(builtin.parentName)} > ${normalizeText(builtin.categoryName)}`;
+          targetCat = categoryMap.get(fullKey) || categoryMap.get(normalizeText(builtin.categoryName));
+        } else {
+          targetCat = categoryMap.get(normalizeText(builtin.categoryName));
+        }
+
+        if (targetCat) {
+          return {
+            categoryId: targetCat.id,
+            categoryName: targetCat.parent ? `${targetCat.parent.name} > ${targetCat.name}` : targetCat.name,
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
