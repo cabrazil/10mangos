@@ -6,10 +6,39 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 export function formatCurrency(value: number, currency: string = "BRL") {
+  if (currency === "USD") {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+    }).format(value);
+  }
   return new Intl.NumberFormat("pt-BR", {
     style: "currency",
-    currency,
+    currency: "BRL",
   }).format(value);
+}
+
+export function parseCurrencyInput(value: string): number {
+  if (!value) return 0;
+  const trimmed = value.trim();
+  // Se contiver vírgula e ponto (ex: "1,234.56" - padrão US ou "1.234,56" - padrão BR)
+  if (trimmed.includes(",") && trimmed.includes(".")) {
+    const lastComma = trimmed.lastIndexOf(",");
+    const lastDot = trimmed.lastIndexOf(".");
+    if (lastComma > lastDot) {
+      // Padrão BR: 1.234,56 -> tira pontos, troca vírgula por ponto
+      return parseFloat(trimmed.replace(/\./g, "").replace(",", "."));
+    } else {
+      // Padrão US: 1,234.56 -> tira vírgulas
+      return parseFloat(trimmed.replace(/,/g, ""));
+    }
+  }
+  // Se contiver apenas vírgula (ex: "1234,56") -> troca por ponto
+  if (trimmed.includes(",")) {
+    return parseFloat(trimmed.replace(",", "."));
+  }
+  // Se contiver apenas ponto ou apenas dígitos (ex: "1234.56" ou "1234") -> direto parseFloat
+  return parseFloat(trimmed);
 }
 
 export function formatDate(dateInput: string | Date | null | undefined): string {

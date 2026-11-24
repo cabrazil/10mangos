@@ -3,14 +3,14 @@
 import React, { useState, useEffect, useRef } from "react";
 import { X, Trash2, Calendar as CalendarIcon, Tag, CreditCard, DollarSign, CheckCircle2, Clock, Copy, ArrowRightLeft, Repeat, Layers, ChevronLeft, ChevronRight } from "lucide-react";
 import { CategoryCombobox } from "./CategoryCombobox";
-import { computeShiftedDate } from "@/lib/utils";
+import { computeShiftedDate, parseCurrencyInput } from "@/lib/utils";
 
 interface EditTransactionModalProps {
   isOpen: boolean;
   onClose: () => void;
   transaction: any;
   categories: Array<{ id: string; name: string; type: string; children?: Array<{ id: string; name: string }> }>;
-  accounts?: Array<{ id: string; name: string; type: string }>;
+  accounts?: Array<{ id: string; name: string; type: string; currency?: string }>;
   onSuccess?: () => void;
 }
 
@@ -39,11 +39,19 @@ export function EditTransactionModal({
   const [deleting, setDeleting] = useState(false);
   const [copying, setCopying] = useState(false);
 
+  const txAccount = accounts.find((a) => a.id === transaction?.accountId) || transaction?.account;
+  const currency = txAccount?.currency || "BRL";
+  const currencySymbol = currency === "USD" ? "$" : "R$";
+
   useEffect(() => {
     if (transaction) {
       setDescription(transaction.description || "");
       const val = Math.abs(Number(transaction.amount || 0));
-      setAmount(val.toFixed(2).replace(".", ","));
+      if (currency === "USD") {
+        setAmount(val.toFixed(2));
+      } else {
+        setAmount(val.toFixed(2).replace(".", ","));
+      }
       setCategoryId(transaction.categoryId || "");
       setStatus(transaction.status || "CLEARED");
       const linkedAccId =
@@ -73,14 +81,17 @@ export function EditTransactionModal({
       }
       setRecurringMonths(12);
     }
-  }, [transaction]);
+  }, [transaction, currency]);
 
   function handleAmountBlur() {
     if (!amount.trim()) return;
-    const clean = amount.replace(/\./g, "").replace(",", ".");
-    const num = parseFloat(clean);
+    const num = parseCurrencyInput(amount);
     if (!isNaN(num) && num >= 0) {
-      setAmount(num.toFixed(2).replace(".", ","));
+      if (currency === "USD") {
+        setAmount(num.toFixed(2));
+      } else {
+        setAmount(num.toFixed(2).replace(".", ","));
+      }
     }
   }
 
@@ -101,7 +112,7 @@ export function EditTransactionModal({
     setLoading(true);
 
     try {
-      const parsedAmount = parseFloat(amount.replace(/\./g, "").replace(",", "."));
+      const parsedAmount = parseCurrencyInput(amount);
       if (isNaN(parsedAmount) || parsedAmount <= 0) {
         alert("Informe um valor válido");
         setLoading(false);
@@ -209,7 +220,7 @@ export function EditTransactionModal({
     setCopying(true);
 
     try {
-      const parsedAmount = parseFloat(amount.replace(/\./g, "").replace(",", "."));
+      const parsedAmount = parseCurrencyInput(amount);
       if (isNaN(parsedAmount) || parsedAmount <= 0) {
         alert("Informe um valor válido");
         setCopying(false);
@@ -331,16 +342,20 @@ export function EditTransactionModal({
             </div>
 
             <div className="col-span-5 space-y-1">
-              <label className="text-[11px] font-semibold text-slate-400">Valor</label>
+              <label className="text-[11px] font-semibold text-slate-400">
+                Valor {currency === "USD" ? "(Dólar · USD)" : "(Reais · BRL)"}
+              </label>
               <div className="relative">
-                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-500">R$</span>
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-500">
+                  {currencySymbol}
+                </span>
                 <input
                   type="text"
                   required
                   value={amount}
                   onChange={(e) => setAmount(e.target.value)}
                   onBlur={handleAmountBlur}
-                  placeholder="0,00"
+                  placeholder={currency === "USD" ? "0.00" : "0,00"}
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-sm font-bold text-slate-100 focus:outline-none focus:border-emerald-500 transition-colors"
                 />
               </div>
@@ -567,11 +582,14 @@ export function EditTransactionModal({
                         <option value={36}>36x</option>
                       </select>
                       {(() => {
-                        const num = parseFloat(amount.replace(/\./g, "").replace(",", "."));
+                        const num = parseCurrencyInput(amount);
                         if (!isNaN(num) && num > 0) {
+                          const valStr = currency === "USD"
+                            ? (num / installments).toFixed(2)
+                            : (num / installments).toFixed(2).replace(".", ",");
                           return (
                             <span className="text-[11px] font-semibold text-indigo-300 bg-indigo-500/15 px-2 py-0.5 rounded border border-indigo-500/30">
-                              {installments}x de R$ {(num / installments).toFixed(2).replace(".", ",")}
+                              {installments}x de {currencySymbol} {valStr}
                             </span>
                           );
                         }

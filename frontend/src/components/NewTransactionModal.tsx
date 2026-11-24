@@ -3,6 +3,7 @@
 import React, { useState, useRef, useEffect } from "react";
 import { X, Calendar as CalendarIcon, Tag, CreditCard, DollarSign, ArrowRight, Layers, Repeat } from "lucide-react";
 import { CategoryCombobox } from "./CategoryCombobox";
+import { parseCurrencyInput } from "@/lib/utils";
 
 export interface InitialTransactionData {
   type?: "EXPENSE" | "INCOME" | "TRANSFER";
@@ -10,6 +11,7 @@ export interface InitialTransactionData {
   description?: string;
   fromAccountId?: string;
   toAccountId?: string;
+  accountId?: string;
   status?: "CLEARED" | "PENDING";
   date?: string;
 }
@@ -17,9 +19,10 @@ export interface InitialTransactionData {
 interface NewTransactionModalProps {
   isOpen: boolean;
   onClose: () => void;
-  accounts: Array<{ id: string; name: string; type: string }>;
+  accounts: Array<{ id: string; name: string; type: string; currency?: string }>;
   categories: Array<{ id: string; name: string; type: string; children?: Array<{ id: string; name: string }> }>;
   defaultDate?: string;
+  defaultAccountId?: string;
   initialData?: InitialTransactionData | null;
   onSuccess?: () => void;
 }
@@ -30,6 +33,7 @@ export function NewTransactionModal({
   accounts,
   categories,
   defaultDate,
+  defaultAccountId,
   initialData,
   onSuccess,
 }: NewTransactionModalProps) {
@@ -38,7 +42,7 @@ export function NewTransactionModal({
   const [amount, setAmount] = useState("");
   const [description, setDescription] = useState("");
   const [date, setDate] = useState(defaultDate || new Date().toISOString().split("T")[0]);
-  const [accountId, setAccountId] = useState(accounts[0]?.id || "");
+  const [accountId, setAccountId] = useState(defaultAccountId || accounts[0]?.id || "");
   const [toAccountId, setToAccountId] = useState(accounts[1]?.id || "");
   const [categoryId, setCategoryId] = useState("");
   const [status, setStatus] = useState<"CLEARED" | "PENDING">("CLEARED");
@@ -46,6 +50,10 @@ export function NewTransactionModal({
   const [recurringMonths, setRecurringMonths] = useState(12);
   const [installments, setInstallments] = useState(1);
   const [loading, setLoading] = useState(false);
+
+  const selectedAccount = accounts.find((a) => a.id === accountId);
+  const currency = selectedAccount?.currency || "BRL";
+  const currencySymbol = currency === "USD" ? "$" : "R$";
 
   function resetForm() {
     if (initialData) {
@@ -58,7 +66,9 @@ export function NewTransactionModal({
       setInstallments(1);
       setStatus(initialData.status || "CLEARED");
       setDate(initialData.date || defaultDate || new Date().toISOString().split("T")[0]);
-      if (initialData.fromAccountId) setAccountId(initialData.fromAccountId);
+      if (initialData.accountId) setAccountId(initialData.accountId);
+      else if (initialData.fromAccountId) setAccountId(initialData.fromAccountId);
+      else if (defaultAccountId) setAccountId(defaultAccountId);
       else if (accounts[0]?.id) setAccountId(accounts[0].id);
 
       if (initialData.toAccountId) setToAccountId(initialData.toAccountId);
@@ -75,7 +85,8 @@ export function NewTransactionModal({
     setInstallments(1);
     setStatus("CLEARED");
     setDate(defaultDate || new Date().toISOString().split("T")[0]);
-    if (accounts[0]?.id) setAccountId(accounts[0].id);
+    if (defaultAccountId) setAccountId(defaultAccountId);
+    else if (accounts[0]?.id) setAccountId(accounts[0].id);
     if (accounts[1]?.id) setToAccountId(accounts[1].id);
   }
 
@@ -83,14 +94,17 @@ export function NewTransactionModal({
     if (isOpen) {
       resetForm();
     }
-  }, [isOpen, initialData]);
+  }, [isOpen, initialData, defaultAccountId]);
 
   function handleAmountBlur() {
     if (!amount.trim()) return;
-    const clean = amount.replace(/\./g, "").replace(",", ".");
-    const num = parseFloat(clean);
+    const num = parseCurrencyInput(amount);
     if (!isNaN(num) && num > 0) {
-      setAmount(num.toFixed(2).replace(".", ","));
+      if (currency === "USD") {
+        setAmount(num.toFixed(2));
+      } else {
+        setAmount(num.toFixed(2).replace(".", ","));
+      }
     }
   }
 
@@ -103,7 +117,7 @@ export function NewTransactionModal({
     setLoading(true);
 
     try {
-      const parsedAmount = parseFloat(amount.replace(/\./g, "").replace(",", "."));
+      const parsedAmount = parseCurrencyInput(amount);
       if (isNaN(parsedAmount) || parsedAmount <= 0) {
         alert("Informe um valor válido");
         setLoading(false);
@@ -233,13 +247,17 @@ export function NewTransactionModal({
               />
             </div>
             <div className="col-span-5 space-y-1">
-              <label className="text-[11px] font-semibold text-slate-400">Valor</label>
+              <label className="text-[11px] font-semibold text-slate-400">
+                Valor {currency === "USD" ? "(Dólar · USD)" : "(Reais · BRL)"}
+              </label>
               <div className="relative">
-                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-500">R$</span>
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-500">
+                  {currencySymbol}
+                </span>
                 <input
                   type="text"
                   required
-                  placeholder="0,00"
+                  placeholder={currency === "USD" ? "0.00" : "0,00"}
                   value={amount}
                   onChange={(e) => setAmount(e.target.value)}
                   onBlur={handleAmountBlur}
@@ -292,7 +310,7 @@ export function NewTransactionModal({
                 >
                   {accounts.map((a) => (
                     <option key={a.id} value={a.id}>
-                      {a.name} ({a.type})
+                      {a.name} ({a.currency === "USD" ? "Dólar · USD" : a.type === "CREDIT_CARD" ? "Cartão" : a.type === "INVESTMENT" ? "Investimento" : "Conta Corrente"})
                     </option>
                   ))}
                 </select>
@@ -434,11 +452,14 @@ export function NewTransactionModal({
                       <option value={36}>36x</option>
                     </select>
                     {(() => {
-                      const num = parseFloat(amount.replace(/\./g, "").replace(",", "."));
+                      const num = parseCurrencyInput(amount);
                       if (!isNaN(num) && num > 0) {
+                        const valStr = currency === "USD"
+                          ? (num / installments).toFixed(2)
+                          : (num / installments).toFixed(2).replace(".", ",");
                         return (
                           <span className="text-[11px] font-semibold text-indigo-300 bg-indigo-500/15 px-2 py-0.5 rounded border border-indigo-500/30">
-                            {installments}x de R$ {(num / installments).toFixed(2).replace(".", ",")}
+                            {installments}x de {currencySymbol} {valStr}
                           </span>
                         );
                       }

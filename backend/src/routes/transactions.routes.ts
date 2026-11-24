@@ -82,7 +82,7 @@ export async function transactionRoutes(app: FastifyInstance) {
       prisma.transaction.findMany({
         where,
         include: {
-          account: { select: { id: true, name: true, type: true, color: true } },
+          account: { select: { id: true, name: true, type: true, color: true, currency: true } },
           category: {
             select: {
               id: true,
@@ -101,7 +101,7 @@ export async function transactionRoutes(app: FastifyInstance) {
                 select: {
                   id: true,
                   accountId: true,
-                  account: { select: { id: true, name: true, type: true, color: true } },
+                  account: { select: { id: true, name: true, type: true, color: true, currency: true } },
                 },
               },
             },
@@ -112,7 +112,7 @@ export async function transactionRoutes(app: FastifyInstance) {
                 select: {
                   id: true,
                   accountId: true,
-                  account: { select: { id: true, name: true, type: true, color: true } },
+                  account: { select: { id: true, name: true, type: true, color: true, currency: true } },
                 },
               },
             },
@@ -814,7 +814,7 @@ export async function transactionRoutes(app: FastifyInstance) {
     const finalResult = await prisma.transaction.findUnique({
       where: { id },
       include: {
-        account: { select: { id: true, name: true, type: true, color: true } },
+        account: { select: { id: true, name: true, type: true, color: true, currency: true } },
         category: {
           select: {
             id: true,
@@ -830,7 +830,7 @@ export async function transactionRoutes(app: FastifyInstance) {
               select: {
                 id: true,
                 accountId: true,
-                account: { select: { id: true, name: true, type: true, color: true } },
+                account: { select: { id: true, name: true, type: true, color: true, currency: true } },
               },
             },
           },
@@ -841,7 +841,7 @@ export async function transactionRoutes(app: FastifyInstance) {
               select: {
                 id: true,
                 accountId: true,
-                account: { select: { id: true, name: true, type: true, color: true } },
+                account: { select: { id: true, name: true, type: true, color: true, currency: true } },
               },
             },
           },

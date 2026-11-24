@@ -825,7 +825,9 @@ export default function DashboardPage() {
                           </>
                         ) : (
                           <>
-                            · Total do filtro: <strong className={filteredTotals.balance >= 0 ? "text-emerald-400" : "text-rose-400"}>{formatCurrency(filteredTotals.balance)}</strong>
+                            · Total do filtro: <strong className={filteredTotals.balance >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                              {formatCurrency(filteredTotals.balance, accounts.find((a) => a.id === accountFilter)?.currency || "BRL")}
+                            </strong>
                           </>
                         )}
                       </span>
@@ -1071,6 +1073,11 @@ export default function DashboardPage() {
                               ) : (
                                 <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-300 border border-slate-700/60">
                                   <Landmark className="h-2.5 w-2.5 text-emerald-400" /> {tx.account?.name}
+                                  {tx.account?.currency === "USD" && (
+                                    <span className="ml-0.5 px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 text-[9px] font-bold">
+                                      USD
+                                    </span>
+                                  )}
                                 </span>
                               )}
                             </div>
@@ -1105,9 +1112,15 @@ export default function DashboardPage() {
                             </button>
                           </div>
                           <div className="text-right">
-                            <p className={`font-bold text-sm ${tx.type === "INCOME" ? "text-emerald-400" : "text-slate-100"}`}>
-                              {Number(tx.amount) > 0 ? `+${formatCurrency(Number(tx.amount))}` : formatCurrency(Number(tx.amount))}
-                            </p>
+                            {(() => {
+                              const txCurr = tx.account?.currency || "BRL";
+                              const amt = Number(tx.amount);
+                              return (
+                                <p className={`font-bold text-sm ${tx.type === "INCOME" ? "text-emerald-400" : "text-slate-100"}`}>
+                                  {amt > 0 ? `+${formatCurrency(amt, txCurr)}` : formatCurrency(amt, txCurr)}
+                                </p>
+                              );
+                            })()}
                             <div className="flex items-center justify-end gap-1 text-[10px]">
                               {tx.status === "CLEARED" ? (
                                 <span className="text-emerald-500/80 flex items-center gap-0.5">
@@ -1141,6 +1154,7 @@ export default function DashboardPage() {
         accounts={accounts}
         categories={categories}
         defaultDate={defaultDateForNewTx}
+        defaultAccountId={accountFilter !== "ALL" && accountFilter !== "BANK_ACCOUNTS" && accountFilter !== "CREDIT_CARDS" ? accountFilter : undefined}
         initialData={newTxInitialData}
         onSuccess={() => {
           const token = localStorage.getItem("token");
