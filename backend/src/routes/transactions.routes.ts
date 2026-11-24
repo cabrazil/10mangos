@@ -117,6 +117,19 @@ export async function transactionRoutes(app: FastifyInstance) {
               },
             },
           },
+          installmentPlan: {
+            select: {
+              id: true,
+              installmentCount: true,
+              description: true,
+            },
+          },
+          recurringRule: {
+            select: {
+              id: true,
+              description: true,
+            },
+          },
         },
         orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
         skip: (query.page - 1) * query.limit,
@@ -470,6 +483,7 @@ export async function transactionRoutes(app: FastifyInstance) {
       isRecurring: z.boolean().optional(),
       recurringMonths: z.number().int().min(1).max(120).optional(),
       installments: z.number().int().min(1).max(120).optional(),
+      applyToFuture: z.boolean().optional(), // Replicar alterações nas parcelas seguintes ou recorrências futuras
     });
 
     const data = updateTransactionSchema.parse(request.body);
@@ -809,6 +823,138 @@ export async function transactionRoutes(app: FastifyInstance) {
           updatedById: userId,
         },
       });
+
+      // Se solicitado aplicar nas parcelas seguintes ou recorrências futuras
+      if (data.applyToFuture) {
+        const newCategory = data.categoryId !== undefined ? data.categoryId : existing.categoryId;
+
+        // Caso 1: Vinculado a um plano de parcelamento oficial (installmentPlanId)
+        if (existing.installmentPlanId) {
+          const currentNumber = existing.installmentNumber || 1;
+          const subsequent = await prisma.transaction.findMany({
+            where: {
+              workspaceId,
+              installmentPlanId: existing.installmentPlanId,
+              installmentNumber: { gt: currentNumber },
+            },
+            include: {
+              installmentPlan: true,
+            },
+          });
+
+          let baseDescription: string | null = null;
+          if (data.description) {
+            baseDescription = data.description
+              .replace(/\s*-\s*Parcela\s*\d+\/\d+/i, "")
+              .replace(/\s*\(\d+\/\d+\)/g, "")
+              .trim();
+          }
+
+          for (const subTx of subsequent) {
+            const totalCount = subTx.installmentPlan?.installmentCount;
+            let subDescription: string | undefined = undefined;
+            if (baseDescription) {
+              subDescription = totalCount
+                ? `${baseDescription} (${subTx.installmentNumber}/${totalCount})`
+                : `${baseDescription} (${subTx.installmentNumber})`;
+            }
+
+            await prisma.transaction.update({
+              where: { id: subTx.id },
+              data: {
+                ...(data.categoryId !== undefined && { categoryId: newCategory }),
+                ...(subDescription && { description: subDescription }),
+                updatedById: userId,
+              },
+            });
+          }
+
+          if (baseDescription || data.categoryId !== undefined) {
+            await prisma.installmentPlan.update({
+              where: { id: existing.installmentPlanId },
+              data: {
+                ...(baseDescription && { description: baseDescription }),
+                ...(data.categoryId !== undefined && { categoryId: newCategory }),
+              },
+            });
+          }
+        } else {
+          // Caso 2: Parcelamento importado (sem installmentPlanId, mas com padrão (i/N) na descrição)
+          const descMatch = (existing.description || "").match(/^(.*?)(?:\s*-\s*Parcela|\s*\()?(\d+)\/(\d+)\)?$/i) ||
+                            (existing.description || "").match(/^(.*?)\s*\((\d+)\/(\d+)\)/);
+
+          if (descMatch) {
+            const rawBase = descMatch[1].trim();
+            const curNum = parseInt(descMatch[2], 10);
+            const totNum = parseInt(descMatch[3], 10);
+
+            let newBase = rawBase;
+            if (data.description) {
+              newBase = data.description
+                .replace(/\s*-\s*Parcela\s*\d+\/\d+/i, "")
+                .replace(/\s*\(\d+\/\d+\)/g, "")
+                .trim();
+            }
+
+            // Buscar outras transações da mesma conta que correspondam a parcelas futuras
+            const otherTxCandidates = await prisma.transaction.findMany({
+              where: {
+                workspaceId,
+                accountId: existing.accountId,
+                id: { not: existing.id },
+              },
+            });
+
+            for (const cand of otherTxCandidates) {
+              const candMatch = (cand.description || "").match(/^(.*?)(?:\s*-\s*Parcela|\s*\()?(\d+)\/(\d+)\)?$/i) ||
+                                (cand.description || "").match(/^(.*?)\s*\((\d+)\/(\d+)\)/);
+
+              if (candMatch) {
+                const candBase = candMatch[1].trim();
+                const candNum = parseInt(candMatch[2], 10);
+                const candTot = parseInt(candMatch[3], 10);
+
+                if (candTot === totNum && candNum > curNum && (candBase === rawBase || candBase.includes(rawBase) || rawBase.includes(candBase))) {
+                  const updatedCandDesc = `${newBase} (${candNum}/${totNum})`;
+                  await prisma.transaction.update({
+                    where: { id: cand.id },
+                    data: {
+                      ...(data.categoryId !== undefined && { categoryId: newCategory }),
+                      description: updatedCandDesc,
+                      updatedById: userId,
+                    },
+                  });
+                }
+              }
+            }
+          }
+        }
+
+        // Caso 3: Recorrência Mensal Fixa (recurringRuleId)
+        if (existing.recurringRuleId) {
+          await prisma.transaction.updateMany({
+            where: {
+              workspaceId,
+              recurringRuleId: existing.recurringRuleId,
+              date: { gt: existing.date },
+              status: TransactionStatus.PENDING,
+            },
+            data: {
+              ...(data.description && { description: data.description }),
+              ...(data.categoryId !== undefined && { categoryId: newCategory }),
+              updatedById: userId,
+            },
+          });
+
+          await prisma.recurringRule.update({
+            where: { id: existing.recurringRuleId },
+            data: {
+              ...(data.description && { description: data.description }),
+              ...(data.categoryId !== undefined && { categoryId: newCategory }),
+            },
+          });
+        }
+      }
     }
 
     const finalResult = await prisma.transaction.findUnique({
@@ -844,6 +990,19 @@ export async function transactionRoutes(app: FastifyInstance) {
                 account: { select: { id: true, name: true, type: true, color: true, currency: true } },
               },
             },
+          },
+        },
+        installmentPlan: {
+          select: {
+            id: true,
+            installmentCount: true,
+            description: true,
+          },
+        },
+        recurringRule: {
+          select: {
+            id: true,
+            description: true,
           },
         },
       },

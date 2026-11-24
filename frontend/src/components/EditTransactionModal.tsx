@@ -35,6 +35,7 @@ export function EditTransactionModal({
   const [recurringMonths, setRecurringMonths] = useState(12);
   const [installments, setInstallments] = useState(1);
   const [createRule, setCreateRule] = useState(false);
+  const [applyToFuture, setApplyToFuture] = useState(true);
   const [loading, setLoading] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [copying, setCopying] = useState(false);
@@ -42,6 +43,14 @@ export function EditTransactionModal({
   const txAccount = accounts.find((a) => a.id === transaction?.accountId) || transaction?.account;
   const currency = txAccount?.currency || "BRL";
   const currencySymbol = currency === "USD" ? "$" : "R$";
+
+  const descMatch = (description || transaction?.description || "").match(/^(.*?)(?:\s*-\s*Parcela|\s*\()?(\d+)\/(\d+)\)?$/i) ||
+                    (description || transaction?.description || "").match(/^(.*?)\s*\((\d+)\/(\d+)\)/);
+  const currentInstallment = transaction?.installmentNumber || (descMatch ? parseInt(descMatch[2], 10) : 1);
+  const totalInstallments = transaction?.installmentPlan?.installmentCount || (descMatch ? parseInt(descMatch[3], 10) : undefined);
+  const isInstallment = Boolean(transaction?.installmentPlanId || descMatch || transaction?.source === "INSTALLMENT");
+  const hasFutureInstallments = isInstallment && (totalInstallments ? currentInstallment < totalInstallments : true);
+  const isRecurring = Boolean(transaction?.recurringRuleId || transaction?.source === "RECURRING");
 
   useEffect(() => {
     if (transaction) {
@@ -148,6 +157,7 @@ export function EditTransactionModal({
           isRecurring,
           recurringMonths: isRecurring ? Number(recurringMonths) : undefined,
           installments: finalInstallments > 1 ? finalInstallments : undefined,
+          applyToFuture: (hasFutureInstallments || isRecurring) ? applyToFuture : undefined,
         }),
       });
 
@@ -421,6 +431,43 @@ export function EditTransactionModal({
                   </label>
                 </div>
               )}
+
+              {hasFutureInstallments && (
+                <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-indigo-950/40 border border-indigo-800/50 text-[11px] text-indigo-200 mt-1.5">
+                  <input
+                    type="checkbox"
+                    id="applyToFutureInstallments"
+                    checked={applyToFuture}
+                    onChange={(e) => setApplyToFuture(e.target.checked)}
+                    className="rounded bg-slate-950 border-slate-700 text-indigo-500 focus:ring-indigo-500/20"
+                  />
+                  <label htmlFor="applyToFutureInstallments" className="cursor-pointer select-none">
+                    Aplicar alterações (descrição e categoria) nas parcelas seguintes{" "}
+                    {totalInstallments ? (
+                      <span className="font-bold text-indigo-300">
+                        ({currentInstallment + 1} a {totalInstallments})
+                      </span>
+                    ) : (
+                      <span className="font-bold text-indigo-300">futuras</span>
+                    )}
+                  </label>
+                </div>
+              )}
+
+              {!hasFutureInstallments && isRecurring && (
+                <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-emerald-950/40 border border-emerald-800/50 text-[11px] text-emerald-200 mt-1.5">
+                  <input
+                    type="checkbox"
+                    id="applyToFutureRecurring"
+                    checked={applyToFuture}
+                    onChange={(e) => setApplyToFuture(e.target.checked)}
+                    className="rounded bg-slate-950 border-slate-700 text-emerald-500 focus:ring-emerald-500/20"
+                  />
+                  <label htmlFor="applyToFutureRecurring" className="cursor-pointer select-none">
+                    Aplicar alterações (descrição e categoria) nos próximos meses previstos
+                  </label>
+                </div>
+              )}
             </div>
           )}
 
@@ -597,10 +644,15 @@ export function EditTransactionModal({
                       })()}
                     </div>
                   </div>
-                  {transaction.installmentPlanId && (
-                    <p className="text-[11px] text-indigo-300/80">
-                      ✓ Parcela atual: {transaction.installmentNumber || 1}.
-                    </p>
+                  {isInstallment && (
+                    <div className="flex items-center justify-between text-[11px] text-indigo-300/80 pt-0.5">
+                      <span>✓ Parcela atual: {currentInstallment}{totalInstallments ? ` de ${totalInstallments}` : ""}.</span>
+                      {totalInstallments && currentInstallment < totalInstallments && (
+                        <span className="text-[10px] text-indigo-400 font-medium">
+                          ({totalInstallments - currentInstallment} parcelas seguintes)
+                        </span>
+                      )}
+                    </div>
                   )}
                 </div>
               )}
