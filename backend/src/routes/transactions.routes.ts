@@ -95,6 +95,28 @@ export async function transactionRoutes(app: FastifyInstance) {
           payee: { select: { id: true, name: true } },
           splits: { include: { category: true } },
           tags: true,
+          transferFrom: {
+            include: {
+              toTransaction: {
+                select: {
+                  id: true,
+                  accountId: true,
+                  account: { select: { id: true, name: true, type: true, color: true } },
+                },
+              },
+            },
+          },
+          transferTo: {
+            include: {
+              fromTransaction: {
+                select: {
+                  id: true,
+                  accountId: true,
+                  account: { select: { id: true, name: true, type: true, color: true } },
+                },
+              },
+            },
+          },
         },
         orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
         skip: (query.page - 1) * query.limit,
@@ -489,6 +511,22 @@ export async function transactionRoutes(app: FastifyInstance) {
 
     let updatedResult;
 
+    // Se mudou de TRANSFER para outro tipo (EXPENSE / INCOME), desvincula e remove contrapartida
+    if (existing.type === TransactionType.TRANSFER && data.type && data.type !== TransactionType.TRANSFER) {
+      const transferToClean = await prisma.transfer.findFirst({
+        where: {
+          OR: [{ fromTransactionId: existing.id }, { toTransactionId: existing.id }],
+        },
+      });
+      if (transferToClean) {
+        const counterpartId = transferToClean.fromTransactionId === existing.id
+          ? transferToClean.toTransactionId
+          : transferToClean.fromTransactionId;
+        await prisma.transfer.delete({ where: { id: transferToClean.id } });
+        await prisma.transaction.delete({ where: { id: counterpartId } }).catch(() => {});
+      }
+    }
+
     // Se solicitado conversão em transferência entre contas, executa tudo em transação atômica
     if (data.type === TransactionType.TRANSFER && data.toAccountId) {
       const destinationAccount = await prisma.account.findFirst({
@@ -577,6 +615,34 @@ export async function transactionRoutes(app: FastifyInstance) {
               },
             });
           }
+        } else {
+          // Já existe transferência associada: sincroniza a contrapartida e o registro de transferência
+          const transferAmount = Math.abs(finalAmount);
+          const isDebit = finalAmount < 0;
+          const counterpartId = existingTransfer.fromTransactionId === existing.id
+            ? existingTransfer.toTransactionId
+            : existingTransfer.fromTransactionId;
+
+          await tx.transaction.update({
+            where: { id: counterpartId },
+            data: {
+              accountId: destinationAccount.id,
+              amount: isDebit ? transferAmount : -transferAmount,
+              date: finalDate,
+              status: finalStatus,
+              ...(data.description && { description: data.description }),
+              updatedById: userId,
+            },
+          });
+
+          await tx.transfer.update({
+            where: { id: existingTransfer.id },
+            data: {
+              amount: transferAmount,
+              date: finalDate,
+              ...(data.description && { description: data.description }),
+            },
+          });
         }
 
         return updated;
@@ -745,7 +811,45 @@ export async function transactionRoutes(app: FastifyInstance) {
       });
     }
 
-    return updatedResult;
+    const finalResult = await prisma.transaction.findUnique({
+      where: { id },
+      include: {
+        account: { select: { id: true, name: true, type: true, color: true } },
+        category: {
+          select: {
+            id: true,
+            name: true,
+            type: true,
+            color: true,
+            parent: { select: { id: true, name: true } },
+          },
+        },
+        transferFrom: {
+          include: {
+            toTransaction: {
+              select: {
+                id: true,
+                accountId: true,
+                account: { select: { id: true, name: true, type: true, color: true } },
+              },
+            },
+          },
+        },
+        transferTo: {
+          include: {
+            fromTransaction: {
+              select: {
+                id: true,
+                accountId: true,
+                account: { select: { id: true, name: true, type: true, color: true } },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    return finalResult || updatedResult;
   });
 
   // Excluir lançamento
@@ -763,6 +867,21 @@ export async function transactionRoutes(app: FastifyInstance) {
 
     if (existing.status === TransactionStatus.RECONCILED) {
       return reply.status(400).send({ error: 'Lançamento conciliado não pode ser excluído.' });
+    }
+
+    // Se é uma transferência vinculada, remove também o registro de transferência e a contrapartida
+    const existingTransfer = await prisma.transfer.findFirst({
+      where: {
+        OR: [{ fromTransactionId: existing.id }, { toTransactionId: existing.id }],
+      },
+    });
+
+    if (existingTransfer) {
+      const counterpartId = existingTransfer.fromTransactionId === existing.id
+        ? existingTransfer.toTransactionId
+        : existingTransfer.fromTransactionId;
+      await prisma.transfer.delete({ where: { id: existingTransfer.id } });
+      await prisma.transaction.delete({ where: { id: counterpartId } }).catch(() => {});
     }
 
     await prisma.transaction.delete({ where: { id } });

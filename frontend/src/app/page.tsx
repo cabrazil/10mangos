@@ -25,6 +25,7 @@ import {
   X,
   Landmark,
   Zap,
+  ArrowRightLeft,
 } from "lucide-react";
 import { formatCurrency, formatDate, computeShiftedDate } from "@/lib/utils";
 import { NewTransactionModal } from "@/components/NewTransactionModal";
@@ -973,9 +974,19 @@ export default function DashboardPage() {
                       >
                         <div className="flex items-center gap-3">
                           <div className={`h-9 w-9 rounded-xl flex items-center justify-center ${
-                            tx.type === "INCOME" ? "bg-emerald-500/10 text-emerald-400" : "bg-slate-800 text-slate-300"
+                            tx.type === "TRANSFER"
+                              ? "bg-sky-500/10 text-sky-400"
+                              : tx.type === "INCOME"
+                              ? "bg-emerald-500/10 text-emerald-400"
+                              : "bg-slate-800 text-slate-300"
                           }`}>
-                            {tx.type === "INCOME" ? <ArrowDownLeft className="h-4 w-4" /> : <ArrowUpRight className="h-4 w-4" />}
+                            {tx.type === "TRANSFER" ? (
+                              <ArrowRightLeft className="h-4 w-4" />
+                            ) : tx.type === "INCOME" ? (
+                              <ArrowDownLeft className="h-4 w-4" />
+                            ) : (
+                              <ArrowUpRight className="h-4 w-4" />
+                            )}
                           </div>
                           <div>
                             <div className="flex items-center gap-2">
@@ -1025,19 +1036,33 @@ export default function DashboardPage() {
                                 return null;
                               })()}
                               <span>•</span>
-                              <span
-                                className={`px-1.5 py-0.5 rounded text-[11px] font-medium ${
-                                  tx.category
-                                    ? "bg-slate-800 text-slate-300"
-                                    : "bg-amber-500/15 text-amber-300 border border-amber-500/30 font-semibold"
-                                }`}
-                              >
-                                {tx.category
-                                  ? tx.category.parent
-                                    ? `${tx.category.parent.name} > ${tx.category.name}`
-                                    : tx.category.name
-                                  : "Sem categoria"}
-                              </span>
+                              {tx.type === "TRANSFER" ? (() => {
+                                const isDebit = Number(tx.amount) < 0;
+                                const linkedAcc = tx.transferFrom?.toTransaction?.account || tx.transferTo?.fromTransaction?.account;
+                                const transferLabel = linkedAcc
+                                  ? (isDebit ? `Transf. ➔ ${linkedAcc.name}` : `Transf. 🠔 ${linkedAcc.name}`)
+                                  : "Transferência";
+                                return (
+                                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-semibold bg-sky-500/15 text-sky-300 border border-sky-500/30">
+                                    <ArrowRightLeft className="h-2.5 w-2.5 text-sky-400" />
+                                    {transferLabel}
+                                  </span>
+                                );
+                              })() : (
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[11px] font-medium ${
+                                    tx.category
+                                      ? "bg-slate-800 text-slate-300"
+                                      : "bg-amber-500/15 text-amber-300 border border-amber-500/30 font-semibold"
+                                  }`}
+                                >
+                                  {tx.category
+                                    ? tx.category.parent
+                                      ? `${tx.category.parent.name} > ${tx.category.name}`
+                                      : tx.category.name
+                                    : "Sem categoria"}
+                                </span>
+                              )}
                               <span>•</span>
                               {tx.account?.type === "CREDIT_CARD" ? (
                                 <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-500/15 text-purple-300 border border-purple-500/30">

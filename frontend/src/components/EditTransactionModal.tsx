@@ -46,8 +46,13 @@ export function EditTransactionModal({
       setAmount(val.toFixed(2).replace(".", ","));
       setCategoryId(transaction.categoryId || "");
       setStatus(transaction.status || "CLEARED");
-      setToAccountId("");
-      if (transaction.type === "TRANSFER") {
+      const linkedAccId =
+        transaction.transferFrom?.toTransaction?.accountId ||
+        transaction.transferTo?.fromTransaction?.accountId ||
+        "";
+      setToAccountId(linkedAccId);
+
+      if (transaction.type === "TRANSFER" || linkedAccId) {
         setType("TRANSFER");
       } else {
         setType(Number(transaction.amount) >= 0 ? "INCOME" : "EXPENSE");
@@ -345,10 +350,17 @@ export function EditTransactionModal({
           {/* Categoria OU Conta de Transferência */}
           {type === "TRANSFER" ? (
             <div className="space-y-1 p-2.5 rounded-xl bg-sky-950/20 border border-sky-800/40">
-              <label className="text-[11px] font-semibold text-sky-300 flex items-center gap-1.5">
-                <ArrowRightLeft className="h-3 w-3 text-sky-400" />
-                Conta Vinculada da Transferência
-              </label>
+              <div className="flex items-center justify-between">
+                <label className="text-[11px] font-semibold text-sky-300 flex items-center gap-1.5">
+                  <ArrowRightLeft className="h-3 w-3 text-sky-400" />
+                  Conta Vinculada da Transferência
+                </label>
+                {toAccountId && (
+                  <span className="text-[10px] text-sky-400 font-medium">
+                    {Number(transaction.amount) < 0 ? "Destino da transferência" : "Origem da transferência"}
+                  </span>
+                )}
+              </div>
               <select
                 required
                 value={toAccountId}
@@ -360,12 +372,12 @@ export function EditTransactionModal({
                   ?.filter((a) => a.id !== transaction.accountId)
                   .map((a) => (
                     <option key={a.id} value={a.id}>
-                      {a.name} ({a.type})
+                      {a.name} ({a.type === "CREDIT_CARD" ? "Cartão de Crédito" : a.type === "INVESTMENT" ? "Investimento" : "Conta Corrente"})
                     </option>
                   ))}
               </select>
               <p className="text-[10px] text-slate-400">
-                💡 O 10mangos criará automaticamente o lançamento de contrapartida na conta selecionada.
+                💡 O 10mangos sincroniza automaticamente os dois lados da transferência entre as contas.
               </p>
             </div>
           ) : (
