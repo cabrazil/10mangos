@@ -35,6 +35,27 @@ async function setInitialBalances() {
 
   console.log(`✅ Conta 'Itau PF' configurada com saldo inicial de -R$ 311,67 em 31/10/2026!`);
 
+  // 2. Conta Inter PF
+  await prisma.account.updateMany({
+    where: {
+      workspaceId: workspace.id,
+      name: 'Inter PF',
+    },
+    data: {
+      initialBalance: 12.70,
+      initialBalanceDate: new Date('2026-10-31T00:00:00Z'),
+    },
+  });
+
+  const interAcc = await prisma.account.findFirst({
+    where: { workspaceId: workspace.id, name: 'Inter PF' },
+  });
+  if (interAcc) {
+    await prisma.$executeRawUnsafe(`SELECT fn_recalculate_account_balance('${interAcc.id}'::uuid);`);
+  }
+
+  console.log(`✅ Conta 'Inter PF' configurada com saldo inicial de R$ 12,70 em 31/10/2026!`);
+
   // Exibir resumo da conta
   const itauAccount = await prisma.account.findFirst({
     where: { workspaceId: workspace.id, name: 'Itau PF' },

@@ -441,6 +441,15 @@ async function main() {
       currency: 'BRL',
       color: '#F97316',
       institutionName: 'Banco Inter',
+      bankCode: '077',
+    },
+    {
+      name: 'Inter PF',
+      type: AccountType.CHECKING,
+      currency: 'BRL',
+      color: '#F97316',
+      institutionName: 'Banco Inter',
+      bankCode: '077',
     },
     {
       name: 'Itau PF',
