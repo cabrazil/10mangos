@@ -158,9 +158,13 @@ function parseImportBuffer(
     }
     const parsed = parseOfxString(ofxText);
     const items: ParsedImportItem[] = [];
+    const occurrences = new Map<string, number>();
 
     for (let i = 0; i < parsed.transactions.length; i++) {
       const trn = parsed.transactions[i];
+      if (isNaN(trn.amount) || !trn.date || isNaN(trn.date.getTime())) {
+        continue;
+      }
       let amount = trn.amount;
       let type: TransactionType = amount >= 0 ? TransactionType.INCOME : TransactionType.EXPENSE;
       const memoLower = trn.memo.toLowerCase();
@@ -192,10 +196,22 @@ function parseImportBuffer(
       }
 
       const dateStr = trn.date.toISOString().split('T')[0];
-      const importHash = crypto
+      const baseKey = `${account.id}_${dateStr}_${amount}_${trn.memo}`;
+      const occIndex = (occurrences.get(baseKey) || 0) + 1;
+      occurrences.set(baseKey, occIndex);
+
+      const legacyHash = crypto
         .createHash('sha256')
-        .update(`${account.id}_${dateStr}_${amount}_${trn.memo}`)
+        .update(baseKey)
         .digest('hex');
+
+      const importHash =
+        occIndex === 1
+          ? legacyHash
+          : crypto
+              .createHash('sha256')
+              .update(`${baseKey}_#${occIndex}`)
+              .digest('hex');
 
       let competenceDate: string | null = null;
       if (account.type === AccountType.CREDIT_CARD && type !== TransactionType.TRANSFER) {
@@ -224,7 +240,7 @@ function parseImportBuffer(
         originalDescription: trn.memo,
         fitId: trn.fitId || null,
         importHash,
-        legacyHash: null,
+        legacyHash,
         installmentNumber: null,
         notes: null,
         suggestedCategoryId: catSuggestion?.categoryId || null,
@@ -235,10 +251,10 @@ function parseImportBuffer(
     return {
       format: 'OFX',
       formatLabel: 'Extrato Bancário OFX',
-      ledgerBalance: parsed.ledgerBalance,
-      balanceDate: parsed.balanceDate ? parsed.balanceDate.toISOString().split('T')[0] : undefined,
-      periodStart: parsed.periodStart ? parsed.periodStart.toISOString().split('T')[0] : undefined,
-      periodEnd: parsed.periodEnd ? parsed.periodEnd.toISOString().split('T')[0] : undefined,
+      ledgerBalance: parsed.ledgerBalance !== undefined && !isNaN(parsed.ledgerBalance) ? parsed.ledgerBalance : undefined,
+      balanceDate: parsed.balanceDate && !isNaN(parsed.balanceDate.getTime()) ? parsed.balanceDate.toISOString().split('T')[0] : undefined,
+      periodStart: parsed.periodStart && !isNaN(parsed.periodStart.getTime()) ? parsed.periodStart.toISOString().split('T')[0] : undefined,
+      periodEnd: parsed.periodEnd && !isNaN(parsed.periodEnd.getTime()) ? parsed.periodEnd.toISOString().split('T')[0] : undefined,
       items,
     };
   }
@@ -538,7 +554,9 @@ export async function importRoutes(app: FastifyInstance) {
 
     const buffer = await data.toBuffer();
     const fileName = data.filename;
-    const accountId = (data.fields.accountId as any)?.value as string;
+    const accountId =
+      ((data.fields.accountId as any)?.value as string) ||
+      ((request.query as any)?.accountId as string);
 
     if (!accountId) {
       return reply.status(400).send({ error: 'Conta de destino não informada' });
@@ -914,79 +932,148 @@ export async function importRoutes(app: FastifyInstance) {
     let created = 0;
     let ignored = 0;
 
-    await prisma.$transaction(async (tx) => {
-      for (const item of body.items) {
-        if (item.action === 'IGNORE') {
-          ignored++;
-          continue;
-        }
+    // Pré-carregar todos os lançamentos existentes da conta em 1 única query (evita N roundtrips no túnel SSH e previne violação de unique constraints)
+    const allAccountTxs = await prisma.transaction.findMany({
+      where: {
+        accountId: account.id,
+        workspaceId,
+      },
+      select: {
+        id: true,
+        description: true,
+        fitId: true,
+        importHash: true,
+        categoryId: true,
+        status: true,
+      },
+    });
 
-        if (item.action === 'RECONCILE' && item.matchedTransactionId) {
-          const existingTx = await tx.transaction.findFirst({
-            where: {
-              id: item.matchedTransactionId,
-              accountId: account.id,
+    const existingTxMap = new Map(allAccountTxs.map((t) => [t.id, t]));
+    const fitIdOwnerMap = new Map<string, string>();
+    const hashOwnerMap = new Map<string, string>();
+
+    for (const t of allAccountTxs) {
+      if (t.fitId) fitIdOwnerMap.set(t.fitId, t.id);
+      if (t.importHash) hashOwnerMap.set(t.importHash, t.id);
+    }
+
+    const reconciledTxIds = new Set<string>();
+
+    await prisma.$transaction(
+      async (tx) => {
+        for (const item of body.items) {
+          if (item.action === 'IGNORE') {
+            ignored++;
+            continue;
+          }
+
+          if (
+            item.action === 'RECONCILE' &&
+            item.matchedTransactionId &&
+            !reconciledTxIds.has(item.matchedTransactionId)
+          ) {
+            const existingTx = existingTxMap.get(item.matchedTransactionId);
+
+            if (existingTx) {
+              reconciledTxIds.add(existingTx.id);
+              const parsedDate = new Date(`${item.date}T12:00:00Z`);
+              const finalDescription =
+                item.keepExistingDescription !== false ? existingTx.description : item.description;
+
+              // Só atribui fitId ou importHash se não pertencer a OUTRO lançamento da mesma conta
+              let safeFitId: string | null = existingTx.fitId;
+              if (item.fitId && (!fitIdOwnerMap.has(item.fitId) || fitIdOwnerMap.get(item.fitId) === existingTx.id)) {
+                safeFitId = item.fitId;
+                fitIdOwnerMap.set(item.fitId, existingTx.id);
+              }
+
+              let safeImportHash: string | null = existingTx.importHash;
+              if (
+                item.importHash &&
+                (!hashOwnerMap.has(item.importHash) || hashOwnerMap.get(item.importHash) === existingTx.id)
+              ) {
+                safeImportHash = item.importHash;
+                hashOwnerMap.set(item.importHash, existingTx.id);
+              }
+
+              // Se o lançamento estava RECONCILED (travado por trigger), primeiro desbloqueia para CLEARED
+              if (existingTx.status === TransactionStatus.RECONCILED) {
+                await tx.transaction.update({
+                  where: { id: existingTx.id },
+                  data: { status: TransactionStatus.CLEARED, reconciliationId: null },
+                });
+              }
+
+              await tx.transaction.update({
+                where: { id: existingTx.id },
+                data: {
+                  status: TransactionStatus.CLEARED,
+                  amount: item.amount,
+                  date: parsedDate,
+                  clearedDate: parsedDate,
+                  description: finalDescription,
+                  originalDescription: item.originalDescription || item.description,
+                  fitId: safeFitId,
+                  importHash: safeImportHash,
+                  categoryId: item.categoryId || existingTx.categoryId || null,
+                },
+              });
+
+              reconciled++;
+              continue;
+            }
+          }
+
+          // Caso action === 'CREATE' (ou fallback se matchedTransactionId não foi encontrado)
+          const parsedDate = new Date(`${item.date}T12:00:00Z`);
+          const parsedCompetence = item.competenceDate ? new Date(`${item.competenceDate}T12:00:00Z`) : null;
+
+          let safeFitId: string | null = item.fitId || null;
+          if (safeFitId && fitIdOwnerMap.has(safeFitId)) {
+            safeFitId = null;
+          }
+
+          let safeImportHash: string | null = item.importHash || null;
+          if (safeImportHash && hashOwnerMap.has(safeImportHash)) {
+            safeImportHash = crypto
+              .createHash('sha256')
+              .update(`${safeImportHash}_${Date.now()}_${Math.random()}`)
+              .digest('hex');
+          }
+
+          const createdTx = await tx.transaction.create({
+            data: {
               workspaceId,
+              accountId: account.id,
+              type: item.type as TransactionType,
+              status: TransactionStatus.CLEARED,
+              source: (item.source as TransactionSource) || TransactionSource.OFX_IMPORT,
+              amount: item.amount,
+              date: parsedDate,
+              clearedDate: parsedDate,
+              competenceDate: parsedCompetence,
+              description: item.description || 'Lançamento importado',
+              originalDescription: item.originalDescription || item.description,
+              fitId: safeFitId,
+              importHash: safeImportHash,
+              categoryId: item.categoryId || null,
+              installmentNumber: item.installmentNumber || null,
+              notes: item.notes || null,
+              createdById: userId,
             },
           });
 
-          if (existingTx) {
-            const parsedDate = new Date(`${item.date}T12:00:00Z`);
-            const finalDescription =
-              item.keepExistingDescription !== false ? existingTx.description : item.description;
+          if (safeFitId) fitIdOwnerMap.set(safeFitId, createdTx.id);
+          if (safeImportHash) hashOwnerMap.set(safeImportHash, createdTx.id);
 
-            await tx.transaction.update({
-              where: { id: existingTx.id },
-              data: {
-                status: TransactionStatus.CLEARED,
-                amount: item.amount,
-                date: parsedDate,
-                clearedDate: parsedDate,
-                description: finalDescription,
-                originalDescription: item.originalDescription || item.description,
-                fitId: item.fitId || existingTx.fitId,
-                importHash: item.importHash || existingTx.importHash,
-                categoryId: item.categoryId || existingTx.categoryId || null,
-              },
-            });
-
-            reconciled++;
-            continue;
-          }
+          created++;
         }
 
-        // Caso action === 'CREATE' (ou fallback se matchedTransactionId não foi encontrado)
-        const parsedDate = new Date(`${item.date}T12:00:00Z`);
-        const parsedCompetence = item.competenceDate ? new Date(`${item.competenceDate}T12:00:00Z`) : null;
-
-        await tx.transaction.create({
-          data: {
-            workspaceId,
-            accountId: account.id,
-            type: item.type as TransactionType,
-            status: TransactionStatus.CLEARED,
-            source: (item.source as TransactionSource) || TransactionSource.OFX_IMPORT,
-            amount: item.amount,
-            date: parsedDate,
-            clearedDate: parsedDate,
-            competenceDate: parsedCompetence,
-            description: item.description || 'Lançamento importado',
-            originalDescription: item.originalDescription || item.description,
-            fitId: item.fitId || null,
-            importHash: item.importHash || null,
-            categoryId: item.categoryId || null,
-            installmentNumber: item.installmentNumber || null,
-            notes: item.notes || null,
-            createdById: userId,
-          },
-        });
-
-        created++;
-      }
-
-      // Garantir recálculo exato do saldo da conta via função nativa do PostgreSQL
-      await tx.$executeRawUnsafe(`SELECT fn_recalculate_account_balance('${account.id}'::uuid);`);
-    });
+        // Garantir recálculo exato do saldo da conta via função nativa do PostgreSQL
+        await tx.$executeRawUnsafe(`SELECT fn_recalculate_account_balance('${account.id}'::uuid);`);
+      },
+      { maxWait: 30000, timeout: 60000 }
+    );
 
     if (created > 0) {
       await runAutoCategorization(prisma, workspaceId).catch(() => {});

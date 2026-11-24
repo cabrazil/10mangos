@@ -624,6 +624,7 @@ export function EditTransactionModal({
                         <option value={10}>10x</option>
                         <option value={11}>11x</option>
                         <option value={12}>12x</option>
+                        <option value={15}>15x</option>
                         <option value={18}>18x</option>
                         <option value={24}>24x</option>
                         <option value={36}>36x</option>

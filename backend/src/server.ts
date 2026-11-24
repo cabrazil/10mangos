@@ -87,7 +87,7 @@ async function bootstrap() {
     const message = error instanceof Error ? error.message : 'Erro desconhecido';
     return reply.status(500).send({
       error: 'Erro interno do servidor',
-      message: process.env.NODE_ENV === 'development' ? message : undefined,
+      message,
     });
   });
 

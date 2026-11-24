@@ -17,6 +17,8 @@ import {
   Check,
   ArrowRightLeft,
   ShieldCheck,
+  Landmark,
+  CreditCard,
 } from "lucide-react";
 import { formatCurrency, formatDate } from "@/lib/utils";
 
@@ -118,7 +120,8 @@ export function ImportModal({
   defaultAccountId,
   onSuccess,
 }: ImportModalProps) {
-  const [selectedAccount, setSelectedAccount] = useState(defaultAccountId || accounts[0]?.id || "");
+  const [mode, setMode] = useState<"CHECKING" | "CREDIT_CARD">("CHECKING");
+  const [selectedAccount, setSelectedAccount] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [step, setStep] = useState<"UPLOAD" | "REVIEW" | "DONE">("UPLOAD");
   const [loading, setLoading] = useState(false);
@@ -126,28 +129,78 @@ export function ImportModal({
   const [previewData, setPreviewData] = useState<PreviewResponse | null>(null);
   const [rows, setRows] = useState<EditableReconciliationItem[]>([]);
   const [filterTab, setFilterTab] = useState<"ALL" | "RECONCILE" | "CREATE" | "IGNORE">("ALL");
-  const [result, setResult] = useState<{
+
+  // Resultado da conciliação de conta corrente
+  const [reconcileResult, setReconcileResult] = useState<{
     reconciled: number;
     created: number;
     ignored: number;
     newBalance?: number | null;
     accountCurrency?: string;
   } | null>(null);
+
+  // Resultado da importação direta de fatura de cartão
+  const [cardResult, setCardResult] = useState<{
+    inserted: number;
+    skipped: number;
+  } | null>(null);
+
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Separar contas correntes/bancárias vs cartões de crédito
+  const checkingAccounts = useMemo(
+    () => accounts.filter((a) => a.type !== "CREDIT_CARD"),
+    [accounts]
+  );
+  const creditCardAccounts = useMemo(
+    () => accounts.filter((a) => a.type === "CREDIT_CARD"),
+    [accounts]
+  );
+
+  const wasOpenRef = useRef(false);
+
+  // Ao abrir o modal (transição false -> true), reseta o formulário e detecta o modo ideal
   useEffect(() => {
-    if (isOpen) {
+    if (isOpen && !wasOpenRef.current) {
       resetForm();
       if (defaultAccountId) {
-        setSelectedAccount(defaultAccountId);
-      } else if (accounts[0]?.id && !selectedAccount) {
-        setSelectedAccount(accounts[0].id);
+        const targetAcc = accounts.find((a) => a.id === defaultAccountId);
+        if (targetAcc?.type === "CREDIT_CARD") {
+          setMode("CREDIT_CARD");
+          setSelectedAccount(targetAcc.id);
+        } else if (targetAcc) {
+          setMode("CHECKING");
+          setSelectedAccount(targetAcc.id);
+        } else {
+          setMode("CHECKING");
+          setSelectedAccount(checkingAccounts[0]?.id || accounts[0]?.id || "");
+        }
+      } else {
+        setMode("CHECKING");
+        setSelectedAccount(checkingAccounts[0]?.id || accounts[0]?.id || "");
       }
     }
-  }, [isOpen, defaultAccountId]);
+    wasOpenRef.current = isOpen;
+  }, [isOpen, defaultAccountId, accounts, checkingAccounts]);
 
-  // Achatar categorias para select simples com hierarquia "Pai > Filho"
+  // Atualizar conta selecionada quando o usuário alternar entre as abas
+  function handleSwitchMode(newMode: "CHECKING" | "CREDIT_CARD") {
+    setMode(newMode);
+    setFile(null);
+    setError(null);
+    setCardResult(null);
+    setReconcileResult(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+    if (newMode === "CHECKING") {
+      setSelectedAccount(checkingAccounts[0]?.id || "");
+    } else {
+      setSelectedAccount(creditCardAccounts[0]?.id || "");
+    }
+  }
+
   const flatCategories = useMemo(() => {
     const list: Array<{ id: string; label: string }> = [];
     const parents = categories.filter((c) => !c.parentId);
@@ -190,7 +243,8 @@ export function ImportModal({
     setPreviewData(null);
     setRows([]);
     setFilterTab("ALL");
-    setResult(null);
+    setReconcileResult(null);
+    setCardResult(null);
     setError(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -202,10 +256,12 @@ export function ImportModal({
     onClose();
   }
 
-  // Passo 1: Analisar arquivo e gerar preview de conciliação inteligente
-  async function handlePreview() {
+  // ===========================================================================
+  // PROCESSO 1: CONCILIAÇÃO DE CONTA CORRENTE (.OFX) -> PREVIEW & MATCHING
+  // ===========================================================================
+  async function handlePreviewReconciliation() {
     if (!file || !selectedAccount) {
-      setError("Selecione um arquivo e a conta de destino.");
+      setError("Selecione o arquivo .ofx e a conta corrente de destino.");
       return;
     }
 
@@ -213,22 +269,29 @@ export function ImportModal({
     setError(null);
 
     const formData = new FormData();
-    formData.append("file", file);
     formData.append("accountId", selectedAccount);
+    formData.append("file", file);
 
     const token = localStorage.getItem("token");
 
     try {
-      const res = await fetch("http://localhost:3333/api/imports/preview", {
-        method: "POST",
-        headers: {
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: formData,
-      });
+      const res = await fetch(
+        `http://localhost:3333/api/imports/preview?accountId=${encodeURIComponent(selectedAccount)}`,
+        {
+          method: "POST",
+          headers: {
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: formData,
+        }
+      );
 
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Erro ao analisar extrato para conciliação");
+      if (!res.ok) {
+        throw new Error(
+          data.message ? `${data.error || "Erro"}: ${data.message}` : data.error || "Erro ao analisar extrato para conciliação"
+        );
+      }
 
       const preview: PreviewResponse = data;
       setPreviewData(preview);
@@ -245,13 +308,12 @@ export function ImportModal({
       setRows(editable);
       setStep("REVIEW");
     } catch (err: any) {
-      setError(err.message || "Falha ao analisar arquivo");
+      setError(err.message || "Falha ao analisar arquivo de extrato");
     } finally {
       setLoading(false);
     }
   }
 
-  // Passo 2: Confirmar conciliação e gravar decisões
   async function handleConfirmReconciliation() {
     if (!previewData) return;
 
@@ -296,9 +358,13 @@ export function ImportModal({
       });
 
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Erro ao confirmar conciliação");
+      if (!res.ok) {
+        throw new Error(
+          data.message ? `${data.error || "Erro"}: ${data.message}` : data.error || "Erro ao confirmar conciliação"
+        );
+      }
 
-      setResult({
+      setReconcileResult({
         reconciled: data.reconciled ?? 0,
         created: data.created ?? 0,
         ignored: data.ignored ?? 0,
@@ -314,12 +380,62 @@ export function ImportModal({
     }
   }
 
+  // ===========================================================================
+  // PROCESSO 2: IMPORTAÇÃO DIRETA DE FATURA DE CARTÃO DE CRÉDITO (.CSV / .XLS)
+  // ===========================================================================
+  async function handleCardDirectImport() {
+    if (!file || !selectedAccount) {
+      setError("Selecione o arquivo da fatura e o cartão de crédito.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setCardResult(null);
+
+    const formData = new FormData();
+    formData.append("accountId", selectedAccount);
+    formData.append("file", file);
+
+    const token = localStorage.getItem("token");
+
+    try {
+      const res = await fetch(
+        `http://localhost:3333/api/imports/organizze-csv?accountId=${encodeURIComponent(selectedAccount)}`,
+        {
+          method: "POST",
+          headers: {
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: formData,
+        }
+      );
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(
+          data.message ? `${data.error || "Erro"}: ${data.message}` : data.error || "Erro ao importar fatura de cartão"
+        );
+      }
+
+      setCardResult({ inserted: data.inserted ?? 0, skipped: data.skipped ?? 0 });
+      setFile(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      onSuccess?.();
+    } catch (err: any) {
+      setError(err.message || "Falha na importação da fatura");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function updateRow(tempId: string, patch: Partial<EditableReconciliationItem>) {
     setRows((prev) =>
       prev.map((r) => {
         if (r.tempId !== tempId) return r;
         const updated = { ...r, ...patch };
-        // Se mudou para RECONCILE e ainda não tem transação selecionada, tenta pré-selecionar a melhor candidata de mesmo sinal
         if (patch.action === "RECONCILE" && !updated.selectedTransactionId && previewData) {
           const sameSignCandidate = previewData.availableCandidates.find(
             (c) => (r.amount < 0 && c.amount < 0) || (r.amount >= 0 && c.amount >= 0)
@@ -333,7 +449,7 @@ export function ImportModal({
     );
   }
 
-  // Contadores e simulação de saldo em tempo real
+  // Contadores e simulação de saldo em tempo real para a Mesa de Conciliação
   const stats = useMemo(() => {
     let reconcileCount = 0;
     let createCount = 0;
@@ -346,10 +462,8 @@ export function ImportModal({
         const targetTx = r.selectedTransactionId ? candidatesMap.get(r.selectedTransactionId) : null;
         if (targetTx) {
           if (targetTx.status === "PENDING") {
-            // Passará de PENDING para CLEARED -> entra no saldo atual pelo valor do extrato
             balanceDelta += r.amount;
           } else {
-            // Já estava CLEARED -> só altera o saldo se o valor do extrato for diferente do valor que estava lançado
             balanceDelta += r.amount - targetTx.amount;
           }
         } else {
@@ -384,32 +498,42 @@ export function ImportModal({
   if (!isOpen) return null;
 
   const accountCurrency = previewData?.account.currency || "BRL";
+  const activeAccountsList = mode === "CHECKING" ? checkingAccounts : creditCardAccounts;
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4">
       <div
         className={`bg-slate-900 border border-slate-800 rounded-2xl w-full shadow-2xl overflow-hidden flex flex-col transition-all duration-200 ${
-          step === "REVIEW" ? "max-w-5xl max-h-[92vh]" : "max-w-md"
+          step === "REVIEW" ? "max-w-5xl max-h-[92vh]" : "max-w-lg"
         }`}
       >
         {/* Cabeçalho */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800 bg-slate-900/90">
           <div className="flex items-center gap-2.5">
-            <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
-              <UploadCloud className="h-5 w-5 text-emerald-400" />
+            <div
+              className={`p-2 rounded-xl border ${
+                mode === "CHECKING"
+                  ? "bg-cyan-500/10 border-cyan-500/20 text-cyan-400"
+                  : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+              }`}
+            >
+              {mode === "CHECKING" ? <Landmark className="h-5 w-5" /> : <CreditCard className="h-5 w-5" />}
             </div>
             <div>
               <h2 className="text-sm sm:text-base font-bold text-slate-100 flex items-center gap-2">
-                {step === "UPLOAD" && "Importar e Conciliar Extrato / Fatura"}
+                {step === "UPLOAD" &&
+                  (mode === "CHECKING"
+                    ? "Conciliação de Conta Corrente (.OFX)"
+                    : "Importar Fatura de Cartão (.CSV / .XLS)")}
                 {step === "REVIEW" && (
                   <>
-                    <span>Conciliação Bancária Inteligente</span>
-                    <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                    <span>Mesa de Conciliação Bancária</span>
+                    <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
                       {previewData?.account.name}
                     </span>
                   </>
                 )}
-                {step === "DONE" && "Conciliação Concluída"}
+                {step === "DONE" && "Conciliação Bancária Concluída"}
               </h2>
               {step === "REVIEW" && previewData && (
                 <p className="text-[11px] text-slate-400">
@@ -432,17 +556,49 @@ export function ImportModal({
           </button>
         </div>
 
-        {/* ETAPA 1: UPLOAD DO ARQUIVO */}
+        {/* ETAPA 1: UPLOAD COM DUAS ABAS DISTINTAS */}
         {step === "UPLOAD" && (
           <div className="p-6 space-y-5">
+            {/* Seletor de Abas: Conta Corrente (.OFX) vs Cartão de Crédito (.CSV/.XLS) */}
+            <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-950 rounded-xl border border-slate-800">
+              <button
+                type="button"
+                onClick={() => handleSwitchMode("CHECKING")}
+                className={`py-2.5 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-2 transition-all ${
+                  mode === "CHECKING"
+                    ? "bg-cyan-500 text-slate-950 shadow-sm"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                <Landmark className="h-4 w-4" />
+                <span>Conta Corrente (.OFX)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleSwitchMode("CREDIT_CARD")}
+                className={`py-2.5 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-2 transition-all ${
+                  mode === "CREDIT_CARD"
+                    ? "bg-emerald-500 text-slate-950 shadow-sm"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                <CreditCard className="h-4 w-4" />
+                <span>Cartão de Crédito (.CSV/.XLS)</span>
+              </button>
+            </div>
+
+            {/* Conta ou Cartão Alvo */}
             <div className="space-y-1.5">
-              <label className="text-xs font-semibold text-slate-400">Conta ou Cartão de Destino</label>
+              <label className="text-xs font-semibold text-slate-400">
+                {mode === "CHECKING" ? "Conta Corrente a Conciliar" : "Cartão de Crédito da Fatura"}
+              </label>
               <select
                 value={selectedAccount}
                 onChange={(e) => setSelectedAccount(e.target.value)}
                 className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm text-slate-100 focus:outline-none focus:border-emerald-500"
               >
-                {accounts.map((a) => (
+                {activeAccountsList.map((a) => (
                   <option key={a.id} value={a.id}>
                     {a.name}
                   </option>
@@ -450,48 +606,111 @@ export function ImportModal({
               </select>
             </div>
 
+            {/* Dropzone específico para cada modo */}
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-400">
-                Arquivo do Extrato ou Fatura (.ofx, .csv, .xls, .xlsx)
+                {mode === "CHECKING"
+                  ? "Arquivo de Extrato Bancário (.ofx)"
+                  : "Arquivo da Fatura do Cartão (.csv, .xls, .xlsx)"}
               </label>
-              <label className="border-2 border-dashed border-slate-800 hover:border-emerald-500/50 rounded-2xl p-6 flex flex-col items-center justify-center gap-2 cursor-pointer transition-colors bg-slate-950/40">
+              <label
+                className={`border-2 border-dashed border-slate-800 rounded-2xl p-6 flex flex-col items-center justify-center gap-2 cursor-pointer transition-colors bg-slate-950/40 ${
+                  mode === "CHECKING" ? "hover:border-cyan-500/50" : "hover:border-emerald-500/50"
+                }`}
+              >
                 <FileSpreadsheet className="h-8 w-8 text-slate-400" />
                 <div className="text-center">
-                  <span className="text-xs font-semibold text-emerald-400">Clique para selecionar</span>
+                  <span
+                    className={`text-xs font-semibold ${
+                      mode === "CHECKING" ? "text-cyan-400" : "text-emerald-400"
+                    }`}
+                  >
+                    Clique para selecionar o arquivo
+                  </span>
                   <span className="text-xs text-slate-500 block">
-                    ou arraste o extrato .ofx, fatura .xlsx/.csv ou planilha aqui
+                    {mode === "CHECKING"
+                      ? "Extrato .ofx exportado do Itaú, Nubank, Inter, etc."
+                      : "Fatura .csv do Nubank ou planilha .xls/.xlsx do Cartão Itaú"}
                   </span>
                 </div>
                 {file && (
-                  <div className="mt-2 px-3 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs font-medium text-emerald-400">
+                  <div
+                    className={`mt-2 px-3 py-1 rounded-lg text-xs font-medium border ${
+                      mode === "CHECKING"
+                        ? "bg-cyan-500/10 border-cyan-500/30 text-cyan-300"
+                        : "bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+                    }`}
+                  >
                     {file.name}
                   </div>
                 )}
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".xls,.xlsx,.csv,.ofx"
+                  accept={mode === "CHECKING" ? ".ofx,.csv,.xls,.xlsx" : ".csv,.xls,.xlsx"}
                   className="hidden"
                   onChange={(e) => {
                     setError(null);
+                    setCardResult(null);
                     setFile(e.target.files?.[0] || null);
                   }}
                 />
               </label>
             </div>
 
-            <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800/80 text-[11px] text-slate-400 space-y-1">
-              <div className="font-semibold text-slate-300 flex items-center gap-1.5">
-                <Sparkles className="h-3.5 w-3.5 text-emerald-400" />
-                <span>Como funciona a Conciliação Inteligente:</span>
+            {/* Explicação contextual de cada modo */}
+            {mode === "CHECKING" ? (
+              <div className="p-3.5 rounded-xl bg-cyan-500/5 border border-cyan-500/20 text-[11px] text-slate-400 space-y-1">
+                <div className="font-semibold text-cyan-300 flex items-center gap-1.5">
+                  <Sparkles className="h-3.5 w-3.5 text-cyan-400" />
+                  <span>Fluxo de Conciliação Bancária (.OFX):</span>
+                </div>
+                <p>
+                  • Abre a <strong>Mesa de Conciliação</strong> para bater o extrato com seus{" "}
+                  <strong>lançamentos previstos e fixos</strong> (IPTU, Luz, Aluguel, Salário).
+                </p>
+                <p>• Efetiva as previsões existentes sem duplicar lançamentos e simula o saldo final da conta.</p>
               </div>
-              <p>
-                • Cruza automaticamente o extrato com seus <strong>lançamentos fixos/previstos</strong> e manuais para{" "}
-                <strong>evitar duplicidades</strong>.
-              </p>
-              <p>• Efetiva contas previstas mantendo suas descrições e categorias personalizadas.</p>
-              <p>• Sugere categorias automaticamente para os novos gastos do período.</p>
-            </div>
+            ) : (
+              <div className="p-3.5 rounded-xl bg-emerald-500/5 border border-emerald-500/20 text-[11px] text-slate-400 space-y-1">
+                <div className="font-semibold text-emerald-300 flex items-center gap-1.5">
+                  <CreditCard className="h-3.5 w-3.5 text-emerald-400" />
+                  <span>Fluxo de Importação de Fatura (.CSV / .XLS):</span>
+                </div>
+                <p>
+                  • Importa as compras da fatura diretamente em <strong>1 clique</strong> com{" "}
+                  <strong>auto-categorização inteligente</strong>.
+                </p>
+                <p>
+                  • Ajusta automaticamente a <strong>competência da fatura</strong> e ignora compras que já foram
+                  importadas antes.
+                </p>
+              </div>
+            )}
+
+            {/* Resultado imediato quando está na aba de Cartão de Crédito */}
+            {mode === "CREDIT_CARD" && cardResult && (
+              <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-300 space-y-2">
+                <div className="flex items-center justify-between font-bold text-emerald-400">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4" />
+                    <span>Fatura Importada com Sucesso!</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={resetForm}
+                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-400/80 hover:text-emerald-300 transition-colors"
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    <span>Importar outra</span>
+                  </button>
+                </div>
+                <p>• {cardResult.inserted} lançamentos da fatura inseridos e categorizados.</p>
+                {cardResult.skipped > 0 && (
+                  <p>• {cardResult.skipped} lançamentos já existentes na fatura foram ignorados.</p>
+                )}
+              </div>
+            )}
 
             {error && (
               <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-xs text-rose-300 flex items-center gap-2">
@@ -506,25 +725,37 @@ export function ImportModal({
                 onClick={handleClose}
                 className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
               >
-                Cancelar
+                Fechar
               </button>
-              <button
-                type="button"
-                onClick={handlePreview}
-                disabled={loading || !file}
-                className="px-5 py-2.5 rounded-xl text-xs font-bold bg-emerald-500 hover:bg-emerald-600 text-slate-950 shadow-md shadow-emerald-500/20 transition-all hover:scale-[1.01] active:scale-[0.99] disabled:opacity-50 flex items-center gap-2"
-              >
-                {loading ? "Analisando Extrato..." : "Analisar e Conciliar"}
-                <ArrowRight className="h-3.5 w-3.5" />
-              </button>
+
+              {mode === "CHECKING" ? (
+                <button
+                  type="button"
+                  onClick={handlePreviewReconciliation}
+                  disabled={loading || !file}
+                  className="px-5 py-2.5 rounded-xl text-xs font-bold bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-md shadow-cyan-500/20 transition-all hover:scale-[1.01] active:scale-[0.99] disabled:opacity-50 flex items-center gap-2"
+                >
+                  {loading ? "Analisando Extrato..." : "Abrir Mesa de Conciliação"}
+                  <ArrowRight className="h-3.5 w-3.5" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleCardDirectImport}
+                  disabled={loading || !file}
+                  className="px-5 py-2.5 rounded-xl text-xs font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-md shadow-emerald-500/20 transition-all hover:scale-[1.01] active:scale-[0.99] disabled:opacity-50 flex items-center gap-2"
+                >
+                  {loading ? "Importando Fatura..." : "Importar Fatura Agora"}
+                  <ArrowRight className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
           </div>
         )}
 
-        {/* ETAPA 2: MESA DE REVISÃO E CONCILIAÇÃO */}
+        {/* ETAPA 2: MESA DE REVISÃO E CONCILIAÇÃO (CONTA CORRENTE) */}
         {step === "REVIEW" && previewData && (
           <>
-            {/* Barra de Resumo & Simulação de Saldo */}
             <div className="px-5 py-3.5 bg-slate-950/60 border-b border-slate-800 space-y-3">
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
                 <button
@@ -536,7 +767,7 @@ export function ImportModal({
                       : "bg-slate-900/60 border-slate-800/80 text-slate-400 hover:bg-slate-800/40"
                   }`}
                 >
-                  <div className="text-[11px] font-medium text-slate-400">Total no Arquivo</div>
+                  <div className="text-[11px] font-medium text-slate-400">Total no Extrato</div>
                   <div className="text-base font-bold text-slate-100">{rows.length} linhas</div>
                 </button>
 
@@ -577,15 +808,15 @@ export function ImportModal({
                   onClick={() => setFilterTab("IGNORE")}
                   className={`p-2.5 rounded-xl border text-left transition-all ${
                     filterTab === "IGNORE"
-                      ? "bg-slate-800 border-slate-600 text-slate-200"
-                      : "bg-slate-900/60 border-slate-800/80 text-slate-400 hover:bg-slate-800/40"
+                      ? "bg-amber-500/15 border-amber-500/50 text-amber-200"
+                      : "bg-amber-500/5 border-amber-500/20 text-slate-300 hover:bg-amber-500/10"
                   }`}
                 >
-                  <div className="text-[11px] font-medium text-slate-400 flex items-center gap-1">
-                    <Ban className="h-3 w-3" />
+                  <div className="text-[11px] font-medium text-amber-400 flex items-center gap-1">
+                    <CheckCircle2 className="h-3 w-3" />
                     <span>Já Importados / Ignorados</span>
                   </div>
-                  <div className="text-base font-bold text-slate-300">{stats.ignoreCount}</div>
+                  <div className="text-base font-bold text-amber-300">{stats.ignoreCount}</div>
                 </button>
               </div>
 
@@ -650,7 +881,6 @@ export function ImportModal({
                     ? candidatesMap.get(row.selectedTransactionId)
                     : null;
 
-                  // Candidatos do mesmo sinal (despesa com despesa, receita com receita) para troca manual
                   const compatibleCandidates = previewData.availableCandidates.filter(
                     (c) => (row.amount < 0 && c.amount < 0) || (row.amount >= 0 && c.amount >= 0)
                   );
@@ -658,14 +888,20 @@ export function ImportModal({
                   return (
                     <div
                       key={row.tempId}
-                      className={`py-3 flex flex-col lg:flex-row lg:items-center justify-between gap-3 transition-colors ${
-                        row.action === "IGNORE" ? "opacity-55" : ""
+                      className={`py-3 px-3 my-1 rounded-xl flex flex-col lg:flex-row lg:items-center justify-between gap-3 transition-colors ${
+                        row.matchStatus === "DUPLICATE"
+                          ? "bg-amber-500/[0.06] border border-amber-500/25 border-l-4 border-l-amber-400"
+                          : row.action === "RECONCILE"
+                          ? "bg-cyan-500/[0.04] border border-cyan-500/15 border-l-4 border-l-cyan-400"
+                          : row.action === "CREATE"
+                          ? "bg-emerald-500/[0.03] border border-emerald-500/15 border-l-4 border-l-emerald-400"
+                          : "opacity-60 bg-slate-950/30"
                       }`}
                     >
                       {/* Coluna 1: Linha do Extrato (Banco) */}
                       <div className="lg:w-[36%] min-w-0 space-y-1">
-                        <div className="flex items-center gap-2">
-                          <span className="text-[11px] font-mono text-slate-400 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-[11px] font-mono text-slate-300 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">
                             {formatDate(row.date)}
                           </span>
                           <span
@@ -677,27 +913,33 @@ export function ImportModal({
                             {formatCurrency(row.amount, accountCurrency)}
                           </span>
                           {row.matchStatus === "MATCH" && (
-                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">
                               <Link2 className="h-2.5 w-2.5" />
                               Match {row.matchScore}%
                             </span>
                           )}
                           {row.matchStatus === "DUPLICATE" && (
-                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400 border border-slate-700">
-                              Já importado
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-400/50 shadow-sm">
+                              <CheckCircle2 className="h-3 w-3 text-amber-400" />
+                              JÁ IMPORTADO
                             </span>
                           )}
                           {row.matchStatus === "NEW" && (
-                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
                               Novo
                             </span>
                           )}
                         </div>
-                        <div className="text-xs font-medium text-slate-200 truncate" title={row.originalDescription}>
+                        <div className="text-xs font-semibold text-slate-100 truncate" title={row.originalDescription}>
                           {row.originalDescription}
                         </div>
                         {row.matchReason && (
-                          <div className="text-[11px] text-slate-400 truncate" title={row.matchReason}>
+                          <div
+                            className={`text-[11px] truncate ${
+                              row.matchStatus === "DUPLICATE" ? "text-amber-300/90 font-medium" : "text-slate-400"
+                            }`}
+                            title={row.matchReason}
+                          >
                             {row.matchReason}
                           </div>
                         )}
@@ -781,7 +1023,8 @@ export function ImportModal({
                             >
                               {compatibleCandidates.map((cand) => (
                                 <option key={cand.id} value={cand.id}>
-                                  {formatDate(cand.date)} • {cand.description} ({formatCurrency(cand.amount, accountCurrency)}){" "}
+                                  {formatDate(cand.date)} • {cand.description} (
+                                  {formatCurrency(cand.amount, accountCurrency)}){" "}
                                   {cand.status === "PENDING" ? "[Previsto]" : "[Efetivado]"}
                                 </option>
                               ))}
@@ -841,9 +1084,26 @@ export function ImportModal({
                         )}
 
                         {row.action === "IGNORE" && (
-                          <div className="px-3 py-2 rounded-xl bg-slate-950/50 border border-slate-800/60 text-[11px] text-slate-500">
-                            Linha ignorada — não criará nem alterará lançamentos.
-                          </div>
+                          row.matchStatus === "DUPLICATE" && row.matchedTransaction ? (
+                            <div className="px-3 py-2 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200 space-y-0.5">
+                              <div className="font-semibold text-amber-300 flex items-center gap-1.5">
+                                <CheckCircle2 className="h-3.5 w-3.5 text-amber-400 flex-shrink-0" />
+                                <span className="truncate">
+                                  Já consta na conta: &ldquo;{row.matchedTransaction.description}&rdquo;
+                                </span>
+                              </div>
+                              <div className="text-[10px] text-amber-300/80">
+                                Ignorado automaticamente para evitar duplicidade
+                                {row.matchedTransaction.categoryName
+                                  ? ` • Categoria: ${row.matchedTransaction.categoryName}`
+                                  : ""}
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="px-3 py-2 rounded-xl bg-slate-950/50 border border-slate-800/60 text-[11px] text-slate-500">
+                              Linha ignorada — não criará nem alterará lançamentos.
+                            </div>
+                          )
                         )}
                       </div>
                     </div>
@@ -868,7 +1128,7 @@ export function ImportModal({
                 className="px-3.5 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors flex items-center gap-1.5"
               >
                 <ArrowLeft className="h-3.5 w-3.5" />
-                <span>Trocar Arquivo</span>
+                <span>Voltar</span>
               </button>
 
               <div className="flex items-center gap-3">
@@ -882,7 +1142,7 @@ export function ImportModal({
                   type="button"
                   onClick={handleConfirmReconciliation}
                   disabled={confirming}
-                  className="px-6 py-2.5 rounded-xl text-xs font-bold bg-emerald-500 hover:bg-emerald-600 text-slate-950 shadow-md shadow-emerald-500/20 transition-all hover:scale-[1.01] active:scale-[0.99] disabled:opacity-50 flex items-center gap-2"
+                  className="px-6 py-2.5 rounded-xl text-xs font-bold bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-md shadow-cyan-500/20 transition-all hover:scale-[1.01] active:scale-[0.99] disabled:opacity-50 flex items-center gap-2"
                 >
                   <Check className="h-4 w-4" />
                   <span>{confirming ? "Aplicando Conciliação..." : "Confirmar Conciliação"}</span>
@@ -892,11 +1152,11 @@ export function ImportModal({
           </>
         )}
 
-        {/* ETAPA 3: RESULTADO FINAL */}
-        {step === "DONE" && result && (
+        {/* ETAPA 3: RESULTADO FINAL DA CONCILIAÇÃO DE CONTA CORRENTE */}
+        {step === "DONE" && reconcileResult && (
           <div className="p-6 space-y-5">
-            <div className="p-5 rounded-2xl bg-emerald-500/10 border border-emerald-500/25 space-y-3">
-              <div className="flex items-center gap-2.5 text-emerald-400 font-bold text-sm">
+            <div className="p-5 rounded-2xl bg-cyan-500/10 border border-cyan-500/25 space-y-3">
+              <div className="flex items-center gap-2.5 text-cyan-400 font-bold text-sm">
                 <CheckCircle2 className="h-5 w-5" />
                 <span>Conciliação Bancária Aplicada com Sucesso!</span>
               </div>
@@ -904,21 +1164,21 @@ export function ImportModal({
               <div className="space-y-1.5 text-xs text-slate-200">
                 <p className="flex items-center justify-between py-1 border-b border-slate-800/60">
                   <span className="text-slate-400">🔗 Conciliados com previstos/manuais (sem duplicar):</span>
-                  <strong className="text-cyan-300">{result.reconciled}</strong>
+                  <strong className="text-cyan-300">{reconcileResult.reconciled}</strong>
                 </p>
                 <p className="flex items-center justify-between py-1 border-b border-slate-800/60">
                   <span className="text-slate-400">➕ Novos lançamentos criados:</span>
-                  <strong className="text-emerald-300">{result.created}</strong>
+                  <strong className="text-emerald-300">{reconcileResult.created}</strong>
                 </p>
                 <p className="flex items-center justify-between py-1 border-b border-slate-800/60">
                   <span className="text-slate-400">🚫 Duplicados / ignorados:</span>
-                  <strong className="text-slate-300">{result.ignored}</strong>
+                  <strong className="text-slate-300">{reconcileResult.ignored}</strong>
                 </p>
-                {result.newBalance !== null && result.newBalance !== undefined && (
+                {reconcileResult.newBalance !== null && reconcileResult.newBalance !== undefined && (
                   <p className="flex items-center justify-between pt-2 text-sm">
                     <span className="font-semibold text-slate-300">💰 Saldo Atualizado da Conta:</span>
                     <strong className="text-emerald-400">
-                      {formatCurrency(result.newBalance, result.accountCurrency || "BRL")}
+                      {formatCurrency(reconcileResult.newBalance, reconcileResult.accountCurrency || "BRL")}
                     </strong>
                   </p>
                 )}
@@ -932,12 +1192,12 @@ export function ImportModal({
                 className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-300 hover:bg-slate-800 transition-colors flex items-center gap-1.5"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
-                <span>Conciliar Outro Arquivo</span>
+                <span>Conciliar Outro Extrato</span>
               </button>
               <button
                 type="button"
                 onClick={handleClose}
-                className="px-6 py-2.5 rounded-xl text-xs font-bold bg-emerald-500 hover:bg-emerald-600 text-slate-950 shadow-md shadow-emerald-500/20 transition-all"
+                className="px-6 py-2.5 rounded-xl text-xs font-bold bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-md shadow-cyan-500/20 transition-all"
               >
                 Concluir e Fechar
               </button>

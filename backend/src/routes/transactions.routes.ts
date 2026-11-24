@@ -703,26 +703,52 @@ export async function transactionRoutes(app: FastifyInstance) {
           },
         });
 
-        // Gerar meses futuros (i = 1 até months - 1) como PENDING
+        // Gerar meses futuros (i = 1 até months - 1) como PENDING (evitando duplicar se já houver recorrência idêntica no mês)
         for (let i = 1; i < months; i++) {
           const occDate = addMonths(finalDate, i);
-          await tx.transaction.create({
-            data: {
+          const mStart = new Date(Date.UTC(occDate.getUTCFullYear(), occDate.getUTCMonth(), 1, 0, 0, 0));
+          const mEnd = new Date(Date.UTC(occDate.getUTCFullYear(), occDate.getUTCMonth() + 1, 0, 23, 59, 59, 999));
+
+          const existingInMonth = await tx.transaction.findFirst({
+            where: {
               workspaceId,
               accountId: existing.accountId,
-              type: data.type || existing.type,
               status: TransactionStatus.PENDING,
-              source: TransactionSource.RECURRING,
-              amount: finalAmount,
-              date: occDate,
-              description: data.description || existing.description,
-              categoryId: data.categoryId !== undefined ? data.categoryId : existing.categoryId,
-              payeeId: existing.payeeId,
-              recurringRuleId: recurringRule.id,
-              createdById: userId,
-              notes: data.notes || existing.notes,
+              description: { equals: (data.description || existing.description).trim(), mode: 'insensitive' },
+              date: { gte: mStart, lte: mEnd },
             },
           });
+
+          if (existingInMonth) {
+            await tx.transaction.update({
+              where: { id: existingInMonth.id },
+              data: {
+                amount: finalAmount,
+                date: occDate,
+                categoryId: data.categoryId !== undefined ? data.categoryId : existing.categoryId,
+                recurringRuleId: recurringRule.id,
+                source: TransactionSource.RECURRING,
+              },
+            });
+          } else {
+            await tx.transaction.create({
+              data: {
+                workspaceId,
+                accountId: existing.accountId,
+                type: data.type || existing.type,
+                status: TransactionStatus.PENDING,
+                source: TransactionSource.RECURRING,
+                amount: finalAmount,
+                date: occDate,
+                description: data.description || existing.description,
+                categoryId: data.categoryId !== undefined ? data.categoryId : existing.categoryId,
+                payeeId: existing.payeeId,
+                recurringRuleId: recurringRule.id,
+                createdById: userId,
+                notes: data.notes || existing.notes,
+              },
+            });
+          }
         }
 
         return updated;

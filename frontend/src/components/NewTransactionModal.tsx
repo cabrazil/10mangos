@@ -45,7 +45,7 @@ export function NewTransactionModal({
   const [accountId, setAccountId] = useState(defaultAccountId || accounts[0]?.id || "");
   const [toAccountId, setToAccountId] = useState(accounts[1]?.id || "");
   const [categoryId, setCategoryId] = useState("");
-  const [status, setStatus] = useState<"CLEARED" | "PENDING">("CLEARED");
+  const [status, setStatus] = useState<"CLEARED" | "PENDING">("PENDING");
   const [repeatType, setRepeatType] = useState<"SINGLE" | "RECURRING" | "INSTALLMENTS">("SINGLE");
   const [recurringMonths, setRecurringMonths] = useState(12);
   const [installments, setInstallments] = useState(1);
@@ -64,7 +64,7 @@ export function NewTransactionModal({
       setRepeatType("SINGLE");
       setRecurringMonths(12);
       setInstallments(1);
-      setStatus(initialData.status || "CLEARED");
+      setStatus(initialData.status || "PENDING");
       setDate(initialData.date || defaultDate || new Date().toISOString().split("T")[0]);
       if (initialData.accountId) setAccountId(initialData.accountId);
       else if (initialData.fromAccountId) setAccountId(initialData.fromAccountId);
@@ -83,7 +83,7 @@ export function NewTransactionModal({
     setRepeatType("SINGLE");
     setRecurringMonths(12);
     setInstallments(1);
-    setStatus("CLEARED");
+    setStatus("PENDING");
     setDate(defaultDate || new Date().toISOString().split("T")[0]);
     if (defaultAccountId) setAccountId(defaultAccountId);
     else if (accounts[0]?.id) setAccountId(accounts[0].id);
@@ -357,8 +357,8 @@ export function NewTransactionModal({
                 onChange={(e) => setStatus(e.target.value as any)}
                 className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-100 focus:outline-none focus:border-emerald-500"
               >
-                <option value="CLEARED">Pago / Efetivado</option>
                 <option value="PENDING">Previsto / Agendado</option>
+                <option value="CLEARED">Pago / Efetivado</option>
               </select>
             </div>
           </div>
@@ -447,6 +447,7 @@ export function NewTransactionModal({
                       <option value={10}>10x</option>
                       <option value={11}>11x</option>
                       <option value={12}>12x</option>
+                      <option value={15}>15x</option>
                       <option value={18}>18x</option>
                       <option value={24}>24x</option>
                       <option value={36}>36x</option>

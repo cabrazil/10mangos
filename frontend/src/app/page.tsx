@@ -26,11 +26,13 @@ import {
   Landmark,
   Zap,
   ArrowRightLeft,
+  PieChart,
 } from "lucide-react";
 import { formatCurrency, formatDate, computeShiftedDate, isFinancialMovement } from "@/lib/utils";
 import { NewTransactionModal } from "@/components/NewTransactionModal";
 import { EditTransactionModal } from "@/components/EditTransactionModal";
 import { ImportModal } from "@/components/ImportModal";
+import { CategoryReportView } from "@/components/CategoryReportView";
 
 const API_BASE = "http://localhost:3333/api";
 
@@ -43,6 +45,7 @@ export default function DashboardPage() {
   const [isNewTxOpen, setIsNewTxOpen] = useState(false);
   const [newTxInitialData, setNewTxInitialData] = useState<any | null>(null);
   const [isImportOpen, setIsImportOpen] = useState(false);
+  const [activeView, setActiveView] = useState<"OVERVIEW" | "CATEGORY_REPORT">("OVERVIEW");
   const [isAutoCategorizing, setIsAutoCategorizing] = useState(false);
   const [selectedTxForEdit, setSelectedTxForEdit] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
@@ -461,7 +464,14 @@ export default function DashboardPage() {
 
           {/* Navegação Principal */}
           <nav className="space-y-1.5">
-            <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg bg-emerald-500/10 text-emerald-400 font-medium text-sm transition-colors text-left">
+            <button
+              onClick={() => setActiveView("OVERVIEW")}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg font-medium text-sm transition-colors text-left ${
+                activeView === "OVERVIEW"
+                  ? "bg-emerald-500/10 text-emerald-400"
+                  : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+              }`}
+            >
               <Home className="h-4 w-4" />
               <span>Visão Geral</span>
             </button>
@@ -477,7 +487,18 @@ export default function DashboardPage() {
               className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-emerald-400/90 bg-emerald-500/5 hover:bg-emerald-500/10 border border-emerald-500/20 font-medium text-sm transition-colors text-left"
             >
               <Sparkles className="h-4 w-4" />
-              <span>Importar Organizze / OFX</span>
+              <span>Importar Arquivo</span>
+            </button>
+            <button
+              onClick={() => setActiveView(activeView === "CATEGORY_REPORT" ? "OVERVIEW" : "CATEGORY_REPORT")}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg font-medium text-sm transition-all text-left border ${
+                activeView === "CATEGORY_REPORT"
+                  ? "bg-cyan-500/15 text-cyan-300 border-cyan-500/40 shadow-sm"
+                  : "text-cyan-400/90 bg-cyan-500/5 hover:bg-cyan-500/10 border-cyan-500/20"
+              }`}
+            >
+              <PieChart className="h-4 w-4" />
+              <span>Gastos por Categoria</span>
             </button>
           </nav>
         </div>
@@ -571,6 +592,18 @@ export default function DashboardPage() {
 
         {/* Área de Conteúdo */}
         <div className="p-8 max-w-7xl w-full mx-auto space-y-8">
+          {activeView === "CATEGORY_REPORT" ? (
+            <CategoryReportView
+              currentDate={currentDate}
+              accounts={accounts}
+              onBack={() => setActiveView("OVERVIEW")}
+              onSelectTransaction={(txId) => {
+                const found = transactions.find((t) => t.id === txId);
+                if (found) setSelectedTxForEdit(found);
+              }}
+            />
+          ) : (
+            <>
           {/* Hero Cards: Resumo do Mês */}
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div className="p-5 rounded-2xl bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-800/80 shadow-sm space-y-2">
@@ -1149,6 +1182,8 @@ export default function DashboardPage() {
               </div>
             </div>
           </div>
+            </>
+          )}
         </div>
       </main>
 
