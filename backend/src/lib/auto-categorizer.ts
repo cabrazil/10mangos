@@ -25,6 +25,31 @@ export function normalizeText(text: string): string {
     .trim();
 }
 
+export function isFinancialMovementDesc(normDesc: string): boolean {
+  if (!normDesc) return false;
+  return (
+    normDesc.includes('pagamento de fatura') ||
+    normDesc.includes('pagamento recebido') ||
+    normDesc.includes('pgto fatura') ||
+    normDesc.includes('pagto fatura') ||
+    normDesc.includes('pagto cartao') ||
+    normDesc.includes('pgto cartao') ||
+    normDesc.includes('pagamento cartao') ||
+    normDesc.includes('tit pag tit ulo') ||
+    normDesc.includes('pagamento boleto') ||
+    normDesc.includes('pagamento de boleto') ||
+    normDesc.includes('resgate cdb') ||
+    normDesc.includes('aplicacao cdb') ||
+    normDesc.includes('resgate poupanca') ||
+    normDesc.includes('aplicacao poupanca') ||
+    normDesc.includes('aplicacao financeira') ||
+    normDesc.includes('resgate investimento') ||
+    normDesc.startsWith('pix transf ') ||
+    normDesc.includes('transf entre contas') ||
+    normDesc.includes('transferencia entre contas')
+  );
+}
+
 interface BuiltinRule {
   parentName?: string;
   categoryName: string; // nome da subcategoria ou da categoria pai
@@ -228,8 +253,11 @@ export async function runAutoCategorization(
     include: { category: true },
   });
 
-  // 3. Buscar transações elegíveis
-  const whereClause: any = { workspaceId };
+  // 3. Buscar transações elegíveis (ignora transferências)
+  const whereClause: any = {
+    workspaceId,
+    type: { not: 'TRANSFER' },
+  };
   if (transactionIds && transactionIds.length > 0) {
     whereClause.id = { in: transactionIds };
   }
@@ -311,8 +339,8 @@ export async function runAutoCategorization(
       }
     }
 
-    // B) Se não casou com regra do usuário, checar catálogo embutido
-    if (!matchedCategoryId) {
+    // B) Se não casou com regra do usuário, checar catálogo embutido (exceto se for movimentação/fatura)
+    if (!matchedCategoryId && !isFinancialMovementDesc(normDesc)) {
       for (const builtin of BUILTIN_RULES) {
         const foundKeyword = builtin.keywords.find(kw => normDesc.includes(kw));
         if (foundKeyword) {

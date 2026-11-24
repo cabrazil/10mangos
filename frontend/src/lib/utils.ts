@@ -92,3 +92,59 @@ export function computeShiftedDate(currentDateStr: string, delta: -1 | 1): strin
     }
   }
 }
+
+export function isFinancialMovement(tx: {
+  type?: string;
+  transferFrom?: any;
+  transferTo?: any;
+  description?: string;
+  category?: any;
+  categoryId?: string | null;
+}): boolean {
+  if (tx.category || tx.categoryId) return false;
+  if (tx.type === "TRANSFER" || tx.transferFrom || tx.transferTo) return true;
+
+  const desc = (tx.description || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+  // Pagamentos de fatura ou cartão
+  if (
+    desc.includes("pagamento de fatura") ||
+    desc.includes("pagamento recebido") ||
+    desc.includes("pgto fatura") ||
+    desc.includes("pagto fatura") ||
+    desc.includes("pagto cartao") ||
+    desc.includes("pgto cartao") ||
+    desc.includes("pagamento cartao") ||
+    desc.includes("tit pag tit ulo") ||
+    desc.includes("pagamento boleto") ||
+    desc.includes("pagamento de boleto")
+  ) {
+    return true;
+  }
+
+  // Investimentos, resgates e aplicações
+  if (
+    desc.includes("resgate cdb") ||
+    desc.includes("aplicacao cdb") ||
+    desc.includes("resgate poupanca") ||
+    desc.includes("aplicacao poupanca") ||
+    desc.includes("aplicacao financeira") ||
+    desc.includes("resgate investimento")
+  ) {
+    return true;
+  }
+
+  // PIX e transferências entre contas
+  if (
+    desc.startsWith("pix transf ") ||
+    desc.includes("transf entre contas") ||
+    desc.includes("transferencia entre contas")
+  ) {
+    return true;
+  }
+
+  return false;
+}

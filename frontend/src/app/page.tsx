@@ -27,7 +27,7 @@ import {
   Zap,
   ArrowRightLeft,
 } from "lucide-react";
-import { formatCurrency, formatDate, computeShiftedDate } from "@/lib/utils";
+import { formatCurrency, formatDate, computeShiftedDate, isFinancialMovement } from "@/lib/utils";
 import { NewTransactionModal } from "@/components/NewTransactionModal";
 import { EditTransactionModal } from "@/components/EditTransactionModal";
 import { ImportModal } from "@/components/ImportModal";
@@ -351,7 +351,7 @@ export default function DashboardPage() {
     [monthlyTransactions]
   );
   const uncategorizedMonthlyCount = useMemo(
-    () => monthlyTransactions.filter((t) => !t.categoryId).length,
+    () => monthlyTransactions.filter((t) => !t.categoryId && !isFinancialMovement(t)).length,
     [monthlyTransactions]
   );
 
@@ -1050,7 +1050,15 @@ export default function DashboardPage() {
                                     {transferLabel}
                                   </span>
                                 );
-                              })() : (
+                              })() : isFinancialMovement(tx) ? (
+                                <span
+                                  title="Movimentação patrimonial interna, pagamento de fatura ou PIX entre contas (não requer categoria de despesa)"
+                                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium bg-slate-800 text-slate-400 border border-slate-700/60"
+                                >
+                                  <ArrowRightLeft className="h-2.5 w-2.5 text-slate-400" />
+                                  Movimentação
+                                </span>
+                              ) : (
                                 <span
                                   className={`px-1.5 py-0.5 rounded text-[11px] font-medium ${
                                     tx.category
