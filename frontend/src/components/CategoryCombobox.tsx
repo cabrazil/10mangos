@@ -122,21 +122,21 @@ export function CategoryCombobox({
           setIsOpen(!isOpen);
           setTimeout(() => inputRef.current?.focus(), 50);
         }}
-        className={`w-full flex items-center justify-between bg-slate-950 border rounded-xl px-3.5 py-2.5 text-sm cursor-pointer transition-colors ${
+        className={`w-full flex items-center justify-between bg-slate-950 border rounded-xl px-3 py-2 text-xs cursor-pointer transition-colors ${
           isOpen ? "border-emerald-500 ring-1 ring-emerald-500/20" : "border-slate-800 hover:border-slate-700"
         }`}
       >
         <div className="flex items-center gap-2 overflow-hidden text-ellipsis whitespace-nowrap">
-          <Tag className="h-4 w-4 text-slate-500 flex-shrink-0" />
+          <Tag className="h-3.5 w-3.5 text-slate-500 flex-shrink-0" />
           {selectedOption ? (
             <div className="flex items-center gap-1.5 text-slate-100 font-medium">
               {selectedOption.parentName && (
-                <span className="text-slate-400 font-normal text-xs">{selectedOption.parentName} &gt;</span>
+                <span className="text-slate-400 font-normal text-[11px]">{selectedOption.parentName} &gt;</span>
               )}
               <span className="text-emerald-400 font-semibold">{selectedOption.name}</span>
             </div>
           ) : (
-            <span className="text-slate-500 text-sm">{placeholder}</span>
+            <span className="text-slate-500 text-xs truncate">{placeholder}</span>
           )}
         </div>
 
